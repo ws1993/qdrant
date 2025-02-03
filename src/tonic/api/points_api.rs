@@ -1,40 +1,53 @@
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use api::grpc::qdrant::points_server::Points;
 use api::grpc::qdrant::{
     ClearPayloadPoints, CountPoints, CountResponse, CreateFieldIndexCollection,
     DeleteFieldIndexCollection, DeletePayloadPoints, DeletePointVectors, DeletePoints,
-    DiscoverBatchPoints, DiscoverBatchResponse, DiscoverPoints, DiscoverResponse, GetPoints,
-    GetResponse, PointsOperationResponse, RecommendBatchPoints, RecommendBatchResponse,
-    RecommendGroupsResponse, RecommendPointGroups, RecommendPoints, RecommendResponse,
-    ScrollPoints, ScrollResponse, SearchBatchPoints, SearchBatchResponse, SearchGroupsResponse,
-    SearchPointGroups, SearchPoints, SearchResponse, SetPayloadPoints, UpdateBatchPoints,
-    UpdateBatchResponse, UpdatePointVectors, UpsertPoints,
+    DiscoverBatchPoints, DiscoverBatchResponse, DiscoverPoints, DiscoverResponse, FacetCounts,
+    FacetResponse, GetPoints, GetResponse, PointsOperationResponse, QueryBatchPoints,
+    QueryBatchResponse, QueryGroupsResponse, QueryPointGroups, QueryPoints, QueryResponse,
+    RecommendBatchPoints, RecommendBatchResponse, RecommendGroupsResponse, RecommendPointGroups,
+    RecommendPoints, RecommendResponse, ScrollPoints, ScrollResponse, SearchBatchPoints,
+    SearchBatchResponse, SearchGroupsResponse, SearchMatrixOffsets, SearchMatrixOffsetsResponse,
+    SearchMatrixPairs, SearchMatrixPairsResponse, SearchMatrixPoints, SearchPointGroups,
+    SearchPoints, SearchResponse, SetPayloadPoints, UpdateBatchPoints, UpdateBatchResponse,
+    UpdatePointVectors, UpsertPoints,
 };
 use collection::operations::types::CoreSearchRequest;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use storage::content_manager::toc::request_hw_counter::RequestHwCounter;
 use storage::dispatcher::Dispatcher;
 use tonic::{Request, Response, Status};
 
-use super::points_common::{
-    delete_vectors, discover, discover_batch, recommend_groups, search_groups, update_batch,
-    update_vectors,
-};
+use super::query_common::*;
+use super::update_common::*;
 use super::validate;
-use crate::tonic::api::points_common::{
-    clear_payload, convert_shard_selector_for_read, core_search_batch, count, create_field_index,
-    delete, delete_field_index, delete_payload, get, overwrite_payload, recommend, recommend_batch,
-    scroll, search, set_payload, upsert,
-};
+use crate::common::inference::extract_token;
+use crate::settings::ServiceConfig;
 use crate::tonic::auth::extract_access;
+use crate::tonic::verification::StrictModeCheckedTocProvider;
 
 pub struct PointsService {
     dispatcher: Arc<Dispatcher>,
+    service_config: ServiceConfig,
 }
 
 impl PointsService {
-    pub fn new(dispatcher: Arc<Dispatcher>) -> Self {
-        Self { dispatcher }
+    pub fn new(dispatcher: Arc<Dispatcher>, service_config: ServiceConfig) -> Self {
+        Self {
+            dispatcher,
+            service_config,
+        }
+    }
+
+    fn get_request_collection_hw_usage_counter(&self, collection_name: String) -> RequestHwCounter {
+        let counter = HwMeasurementAcc::new_with_metrics_drain(
+            self.dispatcher.get_collection_hw_metrics(collection_name),
+        );
+
+        RequestHwCounter::new(counter, self.service_config.hardware_reporting())
     }
 }
 
@@ -47,13 +60,15 @@ impl Points for PointsService {
         validate(request.get_ref())?;
 
         let access = extract_access(&mut request);
+        let inference_token = extract_token(&request);
 
         upsert(
-            self.dispatcher.toc(&access).clone(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             None,
             access,
+            inference_token,
         )
         .await
         .map(|resp| resp.map(Into::into))
@@ -66,13 +81,15 @@ impl Points for PointsService {
         validate(request.get_ref())?;
 
         let access = extract_access(&mut request);
+        let inference_token = extract_token(&request);
 
         delete(
-            self.dispatcher.toc(&access).clone(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             None,
             access,
+            inference_token,
         )
         .await
         .map(|resp| resp.map(Into::into))
@@ -83,11 +100,17 @@ impl Points for PointsService {
 
         let access = extract_access(&mut request);
 
+        let inner_request = request.into_inner();
+
+        let hw_metrics =
+            self.get_request_collection_hw_usage_counter(inner_request.collection_name.clone());
+
         get(
-            self.dispatcher.toc(&access),
-            request.into_inner(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            inner_request,
             None,
             access,
+            hw_metrics,
         )
         .await
     }
@@ -98,14 +121,18 @@ impl Points for PointsService {
     ) -> Result<Response<PointsOperationResponse>, Status> {
         validate(request.get_ref())?;
 
+        // Nothing to verify here.
+
         let access = extract_access(&mut request);
+        let inference_token = extract_token(&request);
 
         update_vectors(
-            self.dispatcher.toc(&access).clone(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             None,
             access,
+            inference_token,
         )
         .await
         .map(|resp| resp.map(Into::into))
@@ -120,7 +147,7 @@ impl Points for PointsService {
         let access = extract_access(&mut request);
 
         delete_vectors(
-            self.dispatcher.toc(&access).clone(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             None,
@@ -139,7 +166,7 @@ impl Points for PointsService {
         let access = extract_access(&mut request);
 
         set_payload(
-            self.dispatcher.toc(&access).clone(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             None,
@@ -158,7 +185,7 @@ impl Points for PointsService {
         let access = extract_access(&mut request);
 
         overwrite_payload(
-            self.dispatcher.toc(&access).clone(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             None,
@@ -177,7 +204,7 @@ impl Points for PointsService {
         let access = extract_access(&mut request);
 
         delete_payload(
-            self.dispatcher.toc(&access).clone(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             None,
@@ -196,7 +223,7 @@ impl Points for PointsService {
         let access = extract_access(&mut request);
 
         clear_payload(
-            self.dispatcher.toc(&access).clone(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             None,
@@ -213,13 +240,15 @@ impl Points for PointsService {
         validate(request.get_ref())?;
 
         let access = extract_access(&mut request);
+        let inference_token = extract_token(&request);
 
         update_batch(
-            self.dispatcher.toc(&access).clone(),
+            &self.dispatcher,
             request.into_inner(),
             None,
             None,
             access,
+            inference_token,
         )
         .await
     }
@@ -268,13 +297,19 @@ impl Points for PointsService {
     ) -> Result<Response<SearchResponse>, Status> {
         validate(request.get_ref())?;
         let access = extract_access(&mut request);
-        search(
-            self.dispatcher.toc(&access),
+        let collection_name = request.get_ref().collection_name.clone();
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
+
+        let res = search(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             access,
+            hw_metrics,
         )
-        .await
+        .await?;
+
+        Ok(res)
     }
 
     async fn search_batch(
@@ -305,15 +340,20 @@ impl Points for PointsService {
             requests.push((core_search_request, shard_selector));
         }
 
-        core_search_batch(
-            self.dispatcher.toc(&access),
-            collection_name,
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name.clone());
+
+        let res = core_search_batch(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            &collection_name,
             requests,
             read_consistency,
             access,
             timeout,
+            hw_metrics,
         )
-        .await
+        .await?;
+
+        Ok(res)
     }
 
     async fn search_groups(
@@ -322,13 +362,18 @@ impl Points for PointsService {
     ) -> Result<Response<SearchGroupsResponse>, Status> {
         validate(request.get_ref())?;
         let access = extract_access(&mut request);
-        search_groups(
-            self.dispatcher.toc(&access),
+        let collection_name = request.get_ref().collection_name.clone();
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
+        let res = search_groups(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             access,
+            hw_metrics,
         )
-        .await
+        .await?;
+
+        Ok(res)
     }
 
     async fn scroll(
@@ -339,11 +384,17 @@ impl Points for PointsService {
 
         let access = extract_access(&mut request);
 
+        let inner_request = request.into_inner();
+
+        let hw_metrics =
+            self.get_request_collection_hw_usage_counter(inner_request.collection_name.clone());
+
         scroll(
-            self.dispatcher.toc(&access),
-            request.into_inner(),
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            inner_request,
             None,
             access,
+            hw_metrics,
         )
         .await
     }
@@ -354,7 +405,17 @@ impl Points for PointsService {
     ) -> Result<Response<RecommendResponse>, Status> {
         validate(request.get_ref())?;
         let access = extract_access(&mut request);
-        recommend(self.dispatcher.toc(&access), request.into_inner(), access).await
+        let collection_name = request.get_ref().collection_name.clone();
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
+        let res = recommend(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            request.into_inner(),
+            access,
+            hw_metrics,
+        )
+        .await?;
+
+        Ok(res)
     }
 
     async fn recommend_batch(
@@ -369,15 +430,21 @@ impl Points for PointsService {
             read_consistency,
             timeout,
         } = request.into_inner();
-        recommend_batch(
-            self.dispatcher.toc(&access),
-            collection_name,
+
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name.clone());
+
+        let res = recommend_batch(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            &collection_name,
             recommend_points,
             read_consistency,
             access,
             timeout.map(Duration::from_secs),
+            hw_metrics,
         )
-        .await
+        .await?;
+
+        Ok(res)
     }
 
     async fn recommend_groups(
@@ -385,10 +452,19 @@ impl Points for PointsService {
         mut request: Request<RecommendPointGroups>,
     ) -> Result<Response<RecommendGroupsResponse>, Status> {
         validate(request.get_ref())?;
-
         let access = extract_access(&mut request);
+        let collection_name = request.get_ref().collection_name.clone();
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
 
-        recommend_groups(self.dispatcher.toc(&access), request.into_inner(), access).await
+        let res = recommend_groups(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            request.into_inner(),
+            access,
+            hw_metrics,
+        )
+        .await?;
+
+        Ok(res)
     }
 
     async fn discover(
@@ -396,10 +472,19 @@ impl Points for PointsService {
         mut request: Request<DiscoverPoints>,
     ) -> Result<Response<DiscoverResponse>, Status> {
         validate(request.get_ref())?;
-
         let access = extract_access(&mut request);
+        let collection_name = request.get_ref().collection_name.clone();
 
-        discover(self.dispatcher.toc(&access), request.into_inner(), access).await
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
+        let res = discover(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            request.into_inner(),
+            access,
+            hw_metrics,
+        )
+        .await?;
+
+        Ok(res)
     }
 
     async fn discover_batch(
@@ -407,9 +492,7 @@ impl Points for PointsService {
         mut request: Request<DiscoverBatchPoints>,
     ) -> Result<Response<DiscoverBatchResponse>, Status> {
         validate(request.get_ref())?;
-
         let access = extract_access(&mut request);
-
         let DiscoverBatchPoints {
             collection_name,
             discover_points,
@@ -417,15 +500,19 @@ impl Points for PointsService {
             timeout,
         } = request.into_inner();
 
-        discover_batch(
-            self.dispatcher.toc(&access),
-            collection_name,
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name.clone());
+        let res = discover_batch(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            &collection_name,
             discover_points,
             read_consistency,
             access,
             timeout.map(Duration::from_secs),
+            hw_metrics,
         )
-        .await
+        .await?;
+
+        Ok(res)
     }
 
     async fn count(
@@ -435,13 +522,161 @@ impl Points for PointsService {
         validate(request.get_ref())?;
 
         let access = extract_access(&mut request);
+        let collection_name = request.get_ref().collection_name.clone();
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
+        let res = count(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            request.into_inner(),
+            None,
+            &access,
+            hw_metrics,
+        )
+        .await?;
 
-        count(
-            self.dispatcher.toc(&access),
+        Ok(res)
+    }
+
+    async fn query(
+        &self,
+        mut request: Request<QueryPoints>,
+    ) -> Result<Response<QueryResponse>, Status> {
+        validate(request.get_ref())?;
+        let access = extract_access(&mut request);
+        let inference_token = extract_token(&request);
+        let collection_name = request.get_ref().collection_name.clone();
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
+
+        let res = query(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
             request.into_inner(),
             None,
             access,
+            hw_metrics,
+            inference_token,
+        )
+        .await?;
+
+        Ok(res)
+    }
+
+    async fn query_batch(
+        &self,
+        mut request: Request<QueryBatchPoints>,
+    ) -> Result<Response<QueryBatchResponse>, Status> {
+        validate(request.get_ref())?;
+        let access = extract_access(&mut request);
+        let inference_token = extract_token(&request);
+        let request = request.into_inner();
+        let QueryBatchPoints {
+            collection_name,
+            query_points,
+            read_consistency,
+            timeout,
+        } = request;
+        let timeout = timeout.map(Duration::from_secs);
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name.clone());
+        let res = query_batch(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            &collection_name,
+            query_points,
+            read_consistency,
+            access,
+            timeout,
+            hw_metrics,
+            inference_token,
+        )
+        .await?;
+
+        Ok(res)
+    }
+
+    async fn query_groups(
+        &self,
+        mut request: Request<QueryPointGroups>,
+    ) -> Result<Response<QueryGroupsResponse>, Status> {
+        let access = extract_access(&mut request);
+        let inference_token = extract_token(&request);
+        let collection_name = request.get_ref().collection_name.clone();
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
+
+        let res = query_groups(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            request.into_inner(),
+            None,
+            access,
+            hw_metrics,
+            inference_token,
+        )
+        .await?;
+
+        Ok(res)
+    }
+    async fn facet(
+        &self,
+        mut request: Request<FacetCounts>,
+    ) -> Result<Response<FacetResponse>, Status> {
+        validate(request.get_ref())?;
+        let access = extract_access(&mut request);
+        let hw_metrics =
+            self.get_request_collection_hw_usage_counter(request.get_ref().collection_name.clone());
+        facet(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            request.into_inner(),
+            access,
+            hw_metrics,
         )
         .await
+    }
+
+    async fn search_matrix_pairs(
+        &self,
+        mut request: Request<SearchMatrixPoints>,
+    ) -> Result<Response<SearchMatrixPairsResponse>, Status> {
+        validate(request.get_ref())?;
+        let access = extract_access(&mut request);
+        let timing = Instant::now();
+        let collection_name = request.get_ref().collection_name.clone();
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
+        let search_matrix_response = search_points_matrix(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            request.into_inner(),
+            access,
+            hw_metrics.get_counter(),
+        )
+        .await?;
+
+        let pairs_response = SearchMatrixPairsResponse {
+            result: Some(SearchMatrixPairs::from(search_matrix_response)),
+            time: timing.elapsed().as_secs_f64(),
+            usage: hw_metrics.to_grpc_api(),
+        };
+
+        Ok(Response::new(pairs_response))
+    }
+
+    async fn search_matrix_offsets(
+        &self,
+        mut request: Request<SearchMatrixPoints>,
+    ) -> Result<Response<SearchMatrixOffsetsResponse>, Status> {
+        validate(request.get_ref())?;
+        let access = extract_access(&mut request);
+        let timing = Instant::now();
+        let collection_name = request.get_ref().collection_name.clone();
+        let hw_metrics = self.get_request_collection_hw_usage_counter(collection_name);
+        let search_matrix_response = search_points_matrix(
+            StrictModeCheckedTocProvider::new(&self.dispatcher),
+            request.into_inner(),
+            access,
+            hw_metrics.get_counter(),
+        )
+        .await?;
+
+        let offsets_response = SearchMatrixOffsetsResponse {
+            result: Some(SearchMatrixOffsets::from(search_matrix_response)),
+            time: timing.elapsed().as_secs_f64(),
+            usage: hw_metrics.to_grpc_api(),
+        };
+
+        Ok(Response::new(offsets_response))
     }
 }

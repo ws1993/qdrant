@@ -6,11 +6,11 @@ use parking_lot::Mutex;
 use super::transfer_tasks_pool::TransferTaskProgress;
 use super::{ShardTransfer, ShardTransferConsensus};
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::shards::channel_service::ChannelService;
 use crate::shards::remote_shard::RemoteShard;
 use crate::shards::replica_set::ReplicaState;
 use crate::shards::shard::ShardId;
 use crate::shards::shard_holder::LockedShardHolder;
+use crate::shards::CollectionId;
 
 /// Orchestrate shard diff transfer
 ///
@@ -23,11 +23,10 @@ use crate::shards::shard_holder::LockedShardHolder;
 /// Before this function, this has happened:
 ///
 /// - The existing shard is kept on the remote
-/// - Set the remote shard state to `PartialSnapshot`
-///   In `PartialSnapshot` state, the remote shard will ignore all operations by default and other
-///   nodes will prevent sending operations to it. Only operations that are forced will be
-///   accepted. This is critical not to mess with the order of operations while recovery is
-///   happening.
+/// - Set the remote shard state to `Recovery`
+///   In `Recovery` state, the remote shard will ignore all operations by default and other nodes
+///   will prevent sending operations to it. Only operations that are forced will be accepted. This
+///   is critical not to mess with the order of operations while recovery is happening.
 ///
 /// During this function, this happens in order:
 ///
@@ -35,7 +34,8 @@ use crate::shards::shard_holder::LockedShardHolder;
 ///   We use the recovery point to try and resolve a WAL delta to transfer to the remote.
 /// - Resolve WAL delta locally
 ///   Find a point in our current WAL to transfer all operations from to the remote. If we cannot
-///   resolve a WAL delta, the transfer is aborted.
+///   resolve a WAL delta, the transfer is aborted. If the resolved delta is empty, we start from
+///   our last WAL entry to ensure the remote does not miss any new updates.
 /// - Queue proxy local shard
 ///   We queue all operations from the WAL delta point for the remote.
 /// - Transfer queued updates to remote, transform into forward proxy
@@ -46,9 +46,9 @@ use crate::shards::shard_holder::LockedShardHolder;
 ///   forward proxy right now so that we can catch any errors as early as possible. The forward
 ///   proxy shard we end up with will not error again once we un-proxify.
 /// - Set shard state to `Partial`
-///   After recovery, we set the shard state from `PartialSnapshot` to `Partial`. We propose an
-///   operation to consensus for this. Our logic explicitly confirms that the remote reaches the
-///   `Partial` state.
+///   After recovery, we set the shard state from `Recovery` to `Partial`. We propose an operation
+///   to consensus for this. Our logic explicitly confirms that the remote reaches the `Partial`
+///   state.
 /// - Wait for Partial state in our replica set
 ///   Wait for the remote shard to be set to `Partial` in our local replica set. That way we
 ///   confirm consensus has also propagated on this node.
@@ -77,9 +77,8 @@ pub(super) async fn transfer_wal_delta(
     progress: Arc<Mutex<TransferTaskProgress>>,
     shard_id: ShardId,
     remote_shard: RemoteShard,
-    channel_service: ChannelService,
     consensus: &dyn ShardTransferConsensus,
-    collection_name: &str,
+    collection_id: &CollectionId,
 ) -> CollectionResult<()> {
     let remote_peer_id = remote_shard.peer_id;
 
@@ -87,7 +86,7 @@ pub(super) async fn transfer_wal_delta(
 
     // Ask remote shard on failed node for recovery point
     let recovery_point = remote_shard
-        .shard_recovery_point(collection_name, shard_id)
+        .shard_recovery_point(collection_id, shard_id)
         .await
         .map_err(|err| {
             CollectionError::service_error(format!(
@@ -97,7 +96,7 @@ pub(super) async fn transfer_wal_delta(
 
     let shard_holder_read = shard_holder.read().await;
 
-    let transferring_shard = shard_holder_read.get_shard(&shard_id);
+    let transferring_shard = shard_holder_read.get_shard(shard_id);
     let Some(replica_set) = transferring_shard else {
         return Err(CollectionError::service_error(format!(
             "Shard {shard_id} cannot be queue proxied because it does not exist"
@@ -105,39 +104,35 @@ pub(super) async fn transfer_wal_delta(
     };
 
     // Resolve WAL delta, get the version to start the diff from
+    let next_wal_version = replica_set.wal_version().await?.map(|n| n + 1);
     let wal_delta_version = replica_set
         .resolve_wal_delta(recovery_point)
         .await
         .map_err(|err| {
             CollectionError::service_error(format!("Failed to resolve shard diff: {err}"))
-        })?;
+        })?
+        // If diff is empty, queue and forward from our version to prevent losing new updates
+        // See: <https://github.com/qdrant/qdrant/pull/5271>
+        .or_else(|| {
+            log::trace!("Remote shard is up-to-date and WAL diff is empty, queueing newly incoming updates (version: {next_wal_version:?})");
+            next_wal_version
+        });
 
-    if let Some(wal_delta_version) = wal_delta_version {
-        // Queue proxy local shard
-        replica_set
-            .queue_proxify_local(remote_shard.clone(), Some(wal_delta_version), progress)
-            .await?;
-
-        debug_assert!(
-            replica_set.is_queue_proxy().await,
-            "Local shard must be a queue proxy",
-        );
-
-        log::trace!("Transfer WAL diff by transferring all current queue proxy updates");
-        replica_set.queue_proxy_flush().await?;
-    } else {
-        log::trace!("Shard is already up-to-date as WAL diff if zero records");
-    }
+    // Queue proxy local shard, start flushing updates to remote
+    replica_set
+        .queue_proxify_local(remote_shard.clone(), wal_delta_version, progress)
+        .await?;
+    debug_assert!(
+        replica_set.is_queue_proxy().await,
+        "Local shard must be a queue proxy",
+    );
+    log::trace!("Transfer WAL diff by transferring all current queue proxy updates");
+    replica_set.queue_proxy_flush().await?;
 
     // Set shard state to Partial
     log::trace!("Shard {shard_id} diff transferred to {remote_peer_id} for diff transfer, switching into next stage through consensus");
     consensus
-        // Note: once we migrate from partial snapshot to recovery, we give this method a proper name
-        .snapshot_recovered_switch_to_partial_confirm_remote(
-            &transfer_config,
-            collection_name,
-            &remote_shard,
-        )
+        .recovered_switch_to_partial_confirm_remote(&transfer_config, collection_id, &remote_shard)
         .await
         .map_err(|err| {
             CollectionError::service_error(format!(
@@ -151,6 +146,7 @@ pub(super) async fn transfer_wal_delta(
     replica_set.queue_proxy_into_forward_proxy().await?;
 
     // Wait for Partial state in our replica set
+    // Consensus sync is done right after this function
     let partial_state = ReplicaState::Partial;
     log::trace!("Wait for local shard to reach {partial_state:?} state");
     replica_set
@@ -165,9 +161,6 @@ pub(super) async fn transfer_wal_delta(
                 "Shard being transferred did not reach {partial_state:?} state in time: {err}",
             ))
         })?;
-
-    // Synchronize all nodes
-    super::await_consensus_sync(consensus, &channel_service, transfer_config.from).await;
 
     log::debug!("Ending shard {shard_id} transfer to peer {remote_peer_id} using diff transfer");
 

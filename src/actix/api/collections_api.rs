@@ -1,10 +1,10 @@
-use std::future::Future;
 use std::time::Duration;
 
 use actix_web::rt::time::Instant;
 use actix_web::{delete, get, patch, post, put, web, HttpResponse, Responder};
 use actix_web_validator::{Json, Path, Query};
 use collection::operations::cluster_ops::ClusterOperations;
+use collection::operations::verification::new_unchecked_verification_pass;
 use serde::Deserialize;
 use storage::content_manager::collection_meta_ops::{
     ChangeAliasesOperation, CollectionMetaOperations, CreateCollection, CreateCollectionOperation,
@@ -32,21 +32,25 @@ impl WaitTimeout {
 }
 
 #[get("/collections")]
-fn get_collections(
+async fn get_collections(
     dispatcher: web::Data<Dispatcher>,
     ActixAccess(access): ActixAccess,
-) -> impl Future<Output = HttpResponse> {
-    helpers::time(async move { do_list_collections(dispatcher.toc(&access), access).await })
+) -> HttpResponse {
+    // No request to verify
+    let pass = new_unchecked_verification_pass();
+
+    helpers::time(do_list_collections(dispatcher.toc(&access, &pass), access)).await
 }
 
 #[get("/aliases")]
 async fn get_aliases(
     dispatcher: web::Data<Dispatcher>,
     ActixAccess(access): ActixAccess,
-) -> impl Responder {
-    let timing = Instant::now();
-    let response = do_list_aliases(dispatcher.toc(&access), access).await;
-    process_response(response, timing)
+) -> HttpResponse {
+    // No request to verify
+    let pass = new_unchecked_verification_pass();
+
+    helpers::time(do_list_aliases(dispatcher.toc(&access, &pass), access)).await
 }
 
 #[get("/collections/{name}")]
@@ -54,10 +58,17 @@ async fn get_collection(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     ActixAccess(access): ActixAccess,
-) -> impl Responder {
-    let timing = Instant::now();
-    let response = do_get_collection(dispatcher.toc(&access), access, &collection.name, None).await;
-    process_response(response, timing)
+) -> HttpResponse {
+    // No request to verify
+    let pass = new_unchecked_verification_pass();
+
+    helpers::time(do_get_collection(
+        dispatcher.toc(&access, &pass),
+        access,
+        &collection.name,
+        None,
+    ))
+    .await
 }
 
 #[get("/collections/{name}/exists")]
@@ -65,10 +76,16 @@ async fn get_collection_existence(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     ActixAccess(access): ActixAccess,
-) -> impl Responder {
-    let timing = Instant::now();
-    let response = do_collection_exists(dispatcher.toc(&access), access, &collection.name).await;
-    process_response(response, timing)
+) -> HttpResponse {
+    // No request to verify
+    let pass = new_unchecked_verification_pass();
+
+    helpers::time(do_collection_exists(
+        dispatcher.toc(&access, &pass),
+        access,
+        &collection.name,
+    ))
+    .await
 }
 
 #[get("/collections/{name}/aliases")]
@@ -76,11 +93,16 @@ async fn get_collection_aliases(
     dispatcher: web::Data<Dispatcher>,
     collection: Path<CollectionPath>,
     ActixAccess(access): ActixAccess,
-) -> impl Responder {
-    let timing = Instant::now();
-    let response =
-        do_list_collection_aliases(dispatcher.toc(&access), access, &collection.name).await;
-    process_response(response, timing)
+) -> HttpResponse {
+    // No request to verify
+    let pass = new_unchecked_verification_pass();
+
+    helpers::time(do_list_collection_aliases(
+        dispatcher.toc(&access, &pass),
+        access,
+        &collection.name,
+    ))
+    .await
 }
 
 #[put("/collections/{name}")]
@@ -90,19 +112,23 @@ async fn create_collection(
     operation: Json<CreateCollection>,
     Query(query): Query<WaitTimeout>,
     ActixAccess(access): ActixAccess,
-) -> impl Responder {
+) -> HttpResponse {
     let timing = Instant::now();
+    let create_collection_op =
+        CreateCollectionOperation::new(collection.name.clone(), operation.into_inner());
+
+    let Ok(create_collection_op) = create_collection_op else {
+        return process_response(create_collection_op, timing, None);
+    };
+
     let response = dispatcher
         .submit_collection_meta_op(
-            CollectionMetaOperations::CreateCollection(CreateCollectionOperation::new(
-                collection.name.clone(),
-                operation.into_inner(),
-            )),
+            CollectionMetaOperations::CreateCollection(create_collection_op),
             access,
             query.timeout(),
         )
         .await;
-    process_response(response, timing)
+    process_response(response, timing, None)
 }
 
 #[patch("/collections/{name}")]
@@ -125,7 +151,7 @@ async fn update_collection(
             query.timeout(),
         )
         .await;
-    process_response(response, timing)
+    process_response(response, timing, None)
 }
 
 #[delete("/collections/{name}")]
@@ -145,7 +171,7 @@ async fn delete_collection(
             query.timeout(),
         )
         .await;
-    process_response(response, timing)
+    process_response(response, timing, None)
 }
 
 #[post("/collections/aliases")]
@@ -163,7 +189,7 @@ async fn update_aliases(
             query.timeout(),
         )
         .await;
-    process_response(response, timing)
+    process_response(response, timing, None)
 }
 
 #[get("/collections/{name}/cluster")]
@@ -172,10 +198,15 @@ async fn get_cluster_info(
     collection: Path<CollectionPath>,
     ActixAccess(access): ActixAccess,
 ) -> impl Responder {
-    let timing = Instant::now();
-    let response =
-        do_get_collection_cluster(dispatcher.toc(&access), access, &collection.name).await;
-    process_response(response, timing)
+    // No request to verify
+    let pass = new_unchecked_verification_pass();
+
+    helpers::time(do_get_collection_cluster(
+        dispatcher.toc(&access, &pass),
+        access,
+        &collection.name,
+    ))
+    .await
 }
 
 #[post("/collections/{name}/cluster")]
@@ -196,7 +227,7 @@ async fn update_collection_cluster(
         wait_timeout,
     )
     .await;
-    process_response(response, timing)
+    process_response(response, timing, None)
 }
 
 // Configure services

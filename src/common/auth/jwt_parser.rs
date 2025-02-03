@@ -35,12 +35,14 @@ impl JwtParser {
     pub fn decode(&self, token: &str) -> Option<Result<Claims, AuthError>> {
         let claims = match decode::<Claims>(token, &self.key, &self.validation) {
             Ok(token_data) => token_data.claims,
-            Err(e) => match e.kind() {
-                ErrorKind::ExpiredSignature | ErrorKind::InvalidSignature => {
-                    return Some(Err(AuthError::Forbidden(e.to_string())))
+            Err(e) => {
+                return match e.kind() {
+                    ErrorKind::ExpiredSignature | ErrorKind::InvalidSignature => {
+                        Some(Err(AuthError::Forbidden(e.to_string())))
+                    }
+                    _ => None,
                 }
-                _ => return None,
-            },
+            }
         };
         if let Err(e) = claims.validate() {
             return Some(Err(AuthError::Unauthorized(e.to_string())));
@@ -74,6 +76,7 @@ mod tests {
             .expect("Time went backwards")
             .as_secs();
         let claims = Claims {
+            sub: None,
             exp: Some(exp),
             access: Access::Collection(CollectionAccessList(vec![CollectionAccess {
                 collection: "collection".to_string(),
@@ -82,7 +85,7 @@ mod tests {
                     vec![
                         (
                             "field1".parse().unwrap(),
-                            ValueVariants::Keyword("value".to_string()),
+                            ValueVariants::String("value".to_string()),
                         ),
                         ("field2".parse().unwrap(), ValueVariants::Integer(42)),
                         ("field3".parse().unwrap(), ValueVariants::Bool(true)),
@@ -111,6 +114,7 @@ mod tests {
             - 31; // 31 seconds in the past, bigger than the 30 seconds leeway
 
         let mut claims = Claims {
+            sub: None,
             exp: Some(exp),
             access: Access::Global(GlobalAccessMode::Read),
             value_exists: None,
@@ -137,6 +141,7 @@ mod tests {
     #[test]
     fn test_invalid_token() {
         let claims = Claims {
+            sub: None,
             exp: None,
             access: Access::Global(GlobalAccessMode::Read),
             value_exists: None,

@@ -1,10 +1,6 @@
-#[cfg(not(target_os = "windows"))]
-mod prof;
-
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 
-use common::cpu::CpuPermit;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use dataset::Dataset;
@@ -12,19 +8,24 @@ use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use itertools::Itertools as _;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
-use segment::fixtures::sparse_fixtures::fixture_sparse_index_ram_from_iter;
-use segment::index::hnsw_index::num_rayon_threads;
+use segment::fixtures::sparse_fixtures::fixture_sparse_index_from_iter;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
-use segment::index::sparse_index::sparse_vector_index::SparseVectorIndex;
+use segment::index::sparse_index::sparse_vector_index::{
+    SparseVectorIndex, SparseVectorIndexOpenArgs,
+};
 use segment::index::{PayloadIndex, VectorIndex};
+use segment::payload_json;
 use segment::types::PayloadSchemaType::Keyword;
-use segment::types::{Condition, FieldCondition, Filter, Payload};
-use serde_json::json;
+use segment::types::{Condition, FieldCondition, Filter};
 use sparse::common::sparse_vector::SparseVector;
 use sparse::common::sparse_vector_fixture::{random_positive_sparse_vector, random_sparse_vector};
-use sparse::index::inverted_index::inverted_index_mmap::InvertedIndexMmap;
+use sparse::index::inverted_index::inverted_index_compressed_mmap::InvertedIndexCompressedMmap;
+use sparse::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use sparse::index::loaders::Csr;
 use tempfile::Builder;
+
+#[cfg(not(target_os = "windows"))]
+mod prof;
 
 const NUM_VECTORS: usize = 50_000;
 const MAX_SPARSE_DIM: usize = 30_000;
@@ -63,7 +64,7 @@ fn sparse_vector_index_search_benchmark_impl(
     vectors: impl ExactSizeIterator<Item = SparseVector>,
     query_vectors: &[SparseVector],
 ) {
-    let mut group = c.benchmark_group(format!("sparse_vector_index_search/{}", group));
+    let mut group = c.benchmark_group(format!("sparse_vector_index_search/{group}"));
     group.sample_size(10);
 
     let vectors_len = vectors.len();
@@ -72,56 +73,47 @@ fn sparse_vector_index_search_benchmark_impl(
 
     let data_dir = Builder::new().prefix("data_dir").tempdir().unwrap();
 
-    let sparse_vector_index = fixture_sparse_index_ram_from_iter(
-        progress("Indexing (1/3)", vectors_len).wrap_iter(vectors),
-        FULL_SCAN_THRESHOLD,
+    let sparse_vector_index = fixture_sparse_index_from_iter::<InvertedIndexRam>(
         data_dir.path(),
-        &stopped,
-        || {
-            let pb = progress("Indexing (2/3)", vectors_len);
-            move || pb.inc(1)
-        },
-    );
+        progress("Indexing (1/2)", vectors_len).wrap_iter(vectors),
+        FULL_SCAN_THRESHOLD,
+        SparseIndexType::MutableRam,
+    )
+    .unwrap();
 
     // adding payload on field
     let field_name = "field";
     let field_value = "important value";
-    let payload: Payload = json!({
-        field_name: field_value,
-    })
-    .into();
+    let payload = payload_json! {field_name: field_value};
+
+    let hw_counter = HardwareCounterCell::new();
 
     // all points have the same payload
-    let mut payload_index = sparse_vector_index.payload_index.borrow_mut();
+    let mut payload_index = sparse_vector_index.payload_index().borrow_mut();
     for idx in 0..NUM_VECTORS {
         payload_index
-            .assign(idx as PointOffsetType, &payload, &None)
+            .set_payload(idx as PointOffsetType, &payload, &None, &hw_counter)
             .unwrap();
     }
     drop(payload_index);
 
     let mut query_vector_it = query_vectors.iter().cycle();
 
-    let permit_cpu_count = num_rayon_threads(0);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
-
     // mmap inverted index
     let mmap_index_dir = Builder::new().prefix("mmap_index_dir").tempdir().unwrap();
     let sparse_index_config =
-        SparseIndexConfig::new(Some(FULL_SCAN_THRESHOLD), SparseIndexType::Mmap);
-    let mut sparse_vector_index_mmap: SparseVectorIndex<InvertedIndexMmap> =
-        SparseVectorIndex::open(
-            sparse_index_config,
-            sparse_vector_index.id_tracker.clone(),
-            sparse_vector_index.vector_storage.clone(),
-            sparse_vector_index.payload_index.clone(),
-            mmap_index_dir.path(),
-            &stopped,
-        )
-        .unwrap();
-    let pb = progress("Indexing (3/3)", vectors_len);
-    sparse_vector_index_mmap
-        .build_index_with_progress(permit, &stopped, || pb.inc(1))
+        SparseIndexConfig::new(Some(FULL_SCAN_THRESHOLD), SparseIndexType::Mmap, None);
+    let pb = progress("Indexing (2/2)", vectors_len);
+    let sparse_vector_index_mmap: SparseVectorIndex<InvertedIndexCompressedMmap<f32>> =
+        SparseVectorIndex::open(SparseVectorIndexOpenArgs {
+            config: sparse_index_config,
+            id_tracker: sparse_vector_index.id_tracker().clone(),
+            vector_storage: sparse_vector_index.vector_storage().clone(),
+            payload_index: sparse_vector_index.payload_index().clone(),
+            path: mmap_index_dir.path(),
+            stopped: &stopped,
+            tick_progress: || pb.inc(1),
+        })
         .unwrap();
     pb.finish_and_clear();
     assert_eq!(sparse_vector_index_mmap.indexed_vector_count(), vectors_len);
@@ -186,11 +178,11 @@ fn sparse_vector_index_search_benchmark_impl(
         });
     }
 
-    let mut payload_index = sparse_vector_index.payload_index.borrow_mut();
+    let mut payload_index = sparse_vector_index.payload_index().borrow_mut();
 
     // create payload field index
     payload_index
-        .set_indexed(&field_name.parse().unwrap(), Keyword.into())
+        .set_indexed(&field_name.parse().unwrap(), Keyword)
         .unwrap();
 
     drop(payload_index);

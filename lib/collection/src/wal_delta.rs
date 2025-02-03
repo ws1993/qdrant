@@ -56,9 +56,6 @@ impl RecoverableWal {
     ) -> crate::wal::Result<(u64, ParkingMutexGuard<'a, SerdeWal<OperationWithClockTag>>)> {
         // Update last seen clock map and correct clock tag if necessary
         if let Some(clock_tag) = &mut operation.clock_tag {
-            // TODO: Do not manually advance here!
-            //
-            // TODO: What does the above `TODO` mean? "Make sure to call `advance_clock_and_correct_tag`, but not `advance_clock`?"
             let operation_accepted = self
                 .newest_clocks
                 .lock()
@@ -104,11 +101,6 @@ impl RecoverableWal {
         self.newest_clocks.lock().await.to_recovery_point()
     }
 
-    #[cfg(test)]
-    pub async fn cutoff_point(&self) -> RecoveryPoint {
-        self.oldest_clocks.lock().await.to_recovery_point()
-    }
-
     pub async fn resolve_wal_delta(
         &self,
         recovery_point: RecoveryPoint,
@@ -126,6 +118,15 @@ impl RecoverableWal {
             newest_clocks,
             oldest_clocks,
         )
+    }
+
+    pub fn wal_version(&self) -> Result<Option<u64>, WalDeltaError> {
+        let wal = self.wal.lock();
+        if wal.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(wal.last_index()))
+        }
     }
 
     /// Append records to this WAL from `other`, starting at operation `append_from` in `other`.
@@ -267,13 +268,13 @@ mod tests {
     use rand::seq::SliceRandom;
     use rand::{Rng, SeedableRng};
     use rstest::rstest;
-    use segment::data_types::vectors::VectorStruct;
+    use segment::data_types::vectors::VectorStructInternal;
     use tempfile::{Builder, TempDir};
     use wal::WalOptions;
 
     use super::*;
     use crate::operations::point_ops::{
-        PointInsertOperationsInternal, PointOperations, PointStruct,
+        PointInsertOperationsInternal, PointOperations, PointStructPersisted,
     };
     use crate::operations::{ClockTag, CollectionUpdateOperations, OperationWithClockTag};
     use crate::shards::local_shard::clock_map::{ClockMap, RecoveryPoint};
@@ -299,9 +300,9 @@ mod tests {
 
     fn mock_operation(id: u64) -> CollectionUpdateOperations {
         CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
-            PointInsertOperationsInternal::PointsList(vec![PointStruct {
+            PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
                 id: id.into(),
-                vector: VectorStruct::from(vec![1.0, 2.0, 3.0]).into(),
+                vector: VectorStructInternal::from(vec![1.0, 2.0, 3.0]).into(),
                 payload: None,
             }]),
         ))
@@ -1269,9 +1270,9 @@ mod tests {
 
                 let bare_operation =
                     CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
-                        PointInsertOperationsInternal::PointsList(vec![PointStruct {
+                        PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
                             id: point_id_source.next().unwrap().into(),
-                            vector: VectorStruct::from(
+                            vector: VectorStructInternal::from(
                                 std::iter::repeat_with(|| rng.gen::<f32>())
                                     .take(3)
                                     .collect::<Vec<_>>(),
@@ -1315,9 +1316,9 @@ mod tests {
 
                 let bare_operation =
                     CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
-                        PointInsertOperationsInternal::PointsList(vec![PointStruct {
+                        PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
                             id: point_id_source.next().unwrap().into(),
-                            vector: VectorStruct::from(
+                            vector: VectorStructInternal::from(
                                 std::iter::repeat_with(|| rng.gen::<f32>())
                                     .take(3)
                                     .collect::<Vec<_>>(),
@@ -1666,7 +1667,7 @@ mod tests {
                 // If we don't allow gaps, we only remove this exact tick from the beginning
                 // If we do allow gaps, we remove this tick and all lower ones from the beginning
                 while {
-                    must_see_ticks.front().map_or(false, |&tick| {
+                    must_see_ticks.front().is_some_and(|&tick| {
                         if allow_gaps {
                             tick <= newer.clock_tick
                         } else {

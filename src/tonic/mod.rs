@@ -2,6 +2,7 @@ mod api;
 mod auth;
 mod logging;
 mod tonic_telemetry;
+pub(super) mod verification;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -14,7 +15,6 @@ use ::api::grpc::grpc_health_v1::{
     HealthCheckRequest as ProtocolHealthCheckRequest,
     HealthCheckResponse as ProtocolHealthCheckResponse,
 };
-use ::api::grpc::models::VersionInfo;
 use ::api::grpc::qdrant::collections_internal_server::CollectionsInternalServer;
 use ::api::grpc::qdrant::collections_server::CollectionsServer;
 use ::api::grpc::qdrant::points_internal_server::PointsInternalServer;
@@ -28,6 +28,8 @@ use ::api::grpc::qdrant::{
     WaitOnConsensusCommitRequest, WaitOnConsensusCommitResponse,
 };
 use ::api::grpc::QDRANT_DESCRIPTOR_SET;
+use ::api::rest::models::VersionInfo;
+use collection::operations::verification::new_unchecked_verification_pass;
 use storage::content_manager::consensus_manager::ConsensusStateRef;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
@@ -157,7 +159,7 @@ pub fn init(
         let qdrant_service = QdrantService::default();
         let health_service = HealthService::default();
         let collections_service = CollectionsService::new(dispatcher.clone());
-        let points_service = PointsService::new(dispatcher.clone());
+        let points_service = PointsService::new(dispatcher.clone(), settings.service.clone());
         let snapshot_service = SnapshotsService::new(dispatcher.clone());
 
         // Only advertise the public services. By default, all services in QDRANT_DESCRIPTOR_SET
@@ -198,7 +200,10 @@ pub fn init(
                 AuthKeys::try_create(
                     &settings.service,
                     dispatcher
-                        .toc(&Access::full("For tonic auth middleware"))
+                        .toc(
+                            &Access::full("For tonic auth middleware"),
+                            &new_unchecked_verification_pass(),
+                        )
                         .clone(),
                 )
                 .map(auth::AuthLayer::new)
@@ -271,12 +276,14 @@ pub fn init_internal(
             let socket = SocketAddr::from((host.parse::<IpAddr>().unwrap(), internal_grpc_port));
 
             let qdrant_service = QdrantService::default();
+            let points_internal_service =
+                PointsInternalService::new(toc.clone(), settings.service.clone());
             let qdrant_internal_service =
                 QdrantInternalService::new(settings, consensus_state.clone());
             let collections_internal_service = CollectionsInternalService::new(toc.clone());
-            let points_internal_service = PointsInternalService::new(toc.clone());
             let shard_snapshots_service = ShardSnapshotsService::new(toc.clone(), http_client);
-            let raft_service = RaftService::new(to_consensus, consensus_state);
+            let raft_service =
+                RaftService::new(to_consensus, consensus_state, tls_config.is_some());
 
             log::debug!("Qdrant internal gRPC listening on {}", internal_grpc_port);
 

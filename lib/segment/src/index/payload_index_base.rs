@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use serde_json::Value;
 
+use super::field_index::FieldIndex;
 use crate::common::operation_error::OperationResult;
 use crate::common::Flusher;
 use crate::index::field_index::{CardinalityEstimation, PayloadBlockCondition};
@@ -17,12 +19,37 @@ pub trait PayloadIndex {
     /// Get indexed fields
     fn indexed_fields(&self) -> HashMap<PayloadKeyType, PayloadFieldSchema>;
 
+    /// Build the index, if not built before, taking the caller by reference only
+    fn build_index(
+        &self,
+        field: PayloadKeyTypeRef,
+        payload_schema: &PayloadFieldSchema,
+    ) -> OperationResult<Option<Vec<FieldIndex>>>;
+
+    /// Apply already built indexes
+    fn apply_index(
+        &mut self,
+        field: PayloadKeyType,
+        payload_schema: PayloadFieldSchema,
+        field_index: Vec<FieldIndex>,
+    ) -> OperationResult<()>;
+
     /// Mark field as one which should be indexed
     fn set_indexed(
         &mut self,
         field: PayloadKeyTypeRef,
-        payload_schema: PayloadFieldSchema,
-    ) -> OperationResult<()>;
+        payload_schema: impl Into<PayloadFieldSchema>,
+    ) -> OperationResult<()> {
+        let payload_schema = payload_schema.into();
+
+        let Some(field_index) = self.build_index(field, &payload_schema)? else {
+            return Ok(());
+        };
+
+        self.apply_index(field.to_owned(), payload_schema, field_index)?;
+
+        Ok(())
+    }
 
     /// Remove index
     fn drop_index(&mut self, field: PayloadKeyTypeRef) -> OperationResult<()>;
@@ -42,12 +69,20 @@ pub trait PayloadIndex {
     /// Return list of all point ids, which satisfy filtering criteria
     ///
     /// A best estimation of the number of available points should be given.
-    fn query_points(&self, query: &Filter) -> Vec<PointOffsetType>;
+    fn query_points(
+        &self,
+        query: &Filter,
+        hw_counter: &HardwareCounterCell,
+    ) -> Vec<PointOffsetType>;
 
     /// Return number of points, indexed by this field
     fn indexed_points(&self, field: PayloadKeyTypeRef) -> usize;
 
-    fn filter_context<'a>(&'a self, filter: &'a Filter) -> Box<dyn FilterContext + 'a>;
+    fn filter_context<'a>(
+        &'a self,
+        filter: &'a Filter,
+        hw_counter: &HardwareCounterCell,
+    ) -> Box<dyn FilterContext + 'a>;
 
     /// Iterate conditions for payload blocks with minimum size of `threshold`
     /// Required for building HNSW index
@@ -57,33 +92,44 @@ pub trait PayloadIndex {
         threshold: usize,
     ) -> Box<dyn Iterator<Item = PayloadBlockCondition> + '_>;
 
-    /// Assign same payload to each given point
-    fn assign_all(&mut self, point_id: PointOffsetType, payload: &Payload) -> OperationResult<()> {
-        self.drop(point_id)?;
-        self.assign(point_id, payload, &None)?;
-        Ok(())
-    }
+    /// Overwrite payload for point_id. If payload already exists, replace it.
+    fn overwrite_payload(
+        &mut self,
+        point_id: PointOffsetType,
+        payload: &Payload,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()>;
 
     /// Assign payload to a concrete point with a concrete payload value
-    fn assign(
+    fn set_payload(
         &mut self,
         point_id: PointOffsetType,
         payload: &Payload,
         key: &Option<JsonPath>,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()>;
 
     /// Get payload for point
-    fn payload(&self, point_id: PointOffsetType) -> OperationResult<Payload>;
+    fn get_payload(
+        &self,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload>;
 
     /// Delete payload by key
-    fn delete(
+    fn delete_payload(
         &mut self,
         point_id: PointOffsetType,
         key: PayloadKeyTypeRef,
+        hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Vec<Value>>;
 
     /// Drop all payload of the point
-    fn drop(&mut self, point_id: PointOffsetType) -> OperationResult<Option<Payload>>;
+    fn clear_payload(
+        &mut self,
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Option<Payload>>;
 
     /// Return function that forces persistence of current storage state.
     fn flusher(&self) -> Flusher;

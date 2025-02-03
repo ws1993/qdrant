@@ -9,10 +9,11 @@ license = "Apache-2.0"
 edition = "2021"
 publish = false
 
+[lints]
+workspace = true
+
 [dependencies]
-anyhow = "1.0.82"
-async-compression = {version="0.3.13", features=["all", "stream"]}
-flate2 = { version = "1.0.30" }
+anyhow = "1.0.95"
+flate2 = { version = "1.0.35" }
 indicatif = { workspace = true }
-project-root = "0.2.2"
 reqwest = { workspace = true }

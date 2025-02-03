@@ -4,6 +4,7 @@ mod prof;
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 use criterion::{criterion_group, criterion_main, BatchSize, Criterion};
 use rand::prelude::StdRng;
@@ -12,12 +13,12 @@ use segment::fixtures::payload_context_fixture::FixtureIdTracker;
 use segment::fixtures::payload_fixtures::{FLT_KEY, INT_KEY};
 use segment::index::struct_payload_index::StructPayloadIndex;
 use segment::index::PayloadIndex;
+use segment::payload_json;
 use segment::payload_storage::in_memory_payload_storage::InMemoryPayloadStorage;
 use segment::payload_storage::PayloadStorage;
 use segment::types::{
     Condition, FieldCondition, Filter, PayloadSchemaType, Range as RangeCondition,
 };
-use serde_json::json;
 use tempfile::Builder;
 
 const NUM_POINTS: usize = 100_000;
@@ -44,16 +45,17 @@ fn range_filtering(c: &mut Criterion) {
 
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
 
+    let hw_counter = HardwareCounterCell::new();
+
     // generate points with payload
     let mut payload_storage = InMemoryPayloadStorage::default();
     for id in 0..NUM_POINTS {
-        let payload = json!({
+        let payload = payload_json! {
             INT_KEY: rng.gen_range(0..MAX_RANGE.round() as usize),
             FLT_KEY: rng.gen_range(0.0..MAX_RANGE),
-        })
-        .into();
+        };
         payload_storage
-            .assign(id as PointOffsetType, &payload)
+            .set(id as PointOffsetType, &payload, &hw_counter)
             .unwrap();
     }
 
@@ -63,6 +65,7 @@ fn range_filtering(c: &mut Criterion) {
     let mut index = StructPayloadIndex::open(
         payload_storage.clone(),
         id_tracker.clone(),
+        std::collections::HashMap::new(),
         dir.path(),
         true,
     )
@@ -70,12 +73,12 @@ fn range_filtering(c: &mut Criterion) {
 
     // add numeric float index
     index
-        .set_indexed(&FLT_KEY.parse().unwrap(), PayloadSchemaType::Float.into())
+        .set_indexed(&FLT_KEY.parse().unwrap(), PayloadSchemaType::Float)
         .unwrap();
 
     // add numeric integer index
     index
-        .set_indexed(&INT_KEY.parse().unwrap(), PayloadSchemaType::Integer.into())
+        .set_indexed(&INT_KEY.parse().unwrap(), PayloadSchemaType::Integer)
         .unwrap();
 
     // make sure all points are indexed
@@ -89,7 +92,7 @@ fn range_filtering(c: &mut Criterion) {
         b.iter_batched(
             || random_range_filter(&mut rng, FLT_KEY),
             |filter| {
-                result_size += index.query_points(&filter).len();
+                result_size += index.query_points(&filter, &hw_counter).len();
                 query_count += 1;
             },
             BatchSize::SmallInput,
@@ -100,7 +103,7 @@ fn range_filtering(c: &mut Criterion) {
         b.iter_batched(
             || random_range_filter(&mut rng, INT_KEY),
             |filter| {
-                result_size += index.query_points(&filter).len();
+                result_size += index.query_points(&filter, &hw_counter).len();
                 query_count += 1;
             },
             BatchSize::SmallInput,
@@ -112,13 +115,20 @@ fn range_filtering(c: &mut Criterion) {
     drop(index);
 
     // reload as IMMUTABLE index
-    let index = StructPayloadIndex::open(payload_storage, id_tracker, dir.path(), false).unwrap();
+    let index = StructPayloadIndex::open(
+        payload_storage,
+        id_tracker,
+        std::collections::HashMap::new(),
+        dir.path(),
+        false,
+    )
+    .unwrap();
 
     group.bench_function("float-immutable-index", |b| {
         b.iter_batched(
             || random_range_filter(&mut rng, FLT_KEY),
             |filter| {
-                result_size += index.query_points(&filter).len();
+                result_size += index.query_points(&filter, &hw_counter).len();
                 query_count += 1;
             },
             BatchSize::SmallInput,
@@ -129,7 +139,7 @@ fn range_filtering(c: &mut Criterion) {
         b.iter_batched(
             || random_range_filter(&mut rng, INT_KEY),
             |filter| {
-                result_size += index.query_points(&filter).len();
+                result_size += index.query_points(&filter, &hw_counter).len();
                 query_count += 1;
             },
             BatchSize::SmallInput,

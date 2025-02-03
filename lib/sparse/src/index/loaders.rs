@@ -5,24 +5,24 @@ use std::mem::size_of;
 use std::path::Path;
 
 use memmap2::Mmap;
+use memory::madvise::{Advice, AdviceSetting};
 use memory::mmap_ops::{open_read_mmap, transmute_from_u8, transmute_from_u8_to_slice};
 use validator::ValidationErrors;
 
 use crate::common::sparse_vector::SparseVector;
 
-/// Compressed Sparse Row matrix, baked by memory-mapped file.
+/// Compressed Sparse Row matrix, backed by memory-mapped file.
 ///
 /// The layout of the memory-mapped file is as follows:
 ///
-/// =======  ===========  ==========  ===================
-/// name     type         size        start
-/// =======  ===========  ==========  ===================
-/// nrow     u64          8           0
-/// ncol     u64          8           8
-/// nnz      u64          8           16
-/// indptr   u64[nrow+1]  8*(nrow+1)  24
-/// indices  u32[nnz]     4*nnz       24+8*(nrow+1)
-/// data     u32[nnz]     4*nnz       24+8*(nrow+1)+4*nnz
+/// | name    | type          | size       | start               |
+/// |---------|---------------|------------|---------------------|
+/// | nrow    | `u64`         | 8          | 0                   |
+/// | ncol    | `u64`         | 8          | 8                   |
+/// | nnz     | `u64`         | 8          | 16                  |
+/// | indptr  | `u64[nrow+1]` | 8*(nrow+1) | 24                  |
+/// | indices | `u32[nnz]`    | 4*nnz      | 24+8*(nrow+1)       |
+/// | data    | `u32[nnz]`    | 4*nnz      | 24+8*(nrow+1)+4*nnz |
 pub struct Csr {
     mmap: Mmap,
 
@@ -35,7 +35,11 @@ const CSR_HEADER_SIZE: usize = size_of::<u64>() * 3;
 
 impl Csr {
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        Self::from_mmap(open_read_mmap(path.as_ref())?)
+        Self::from_mmap(open_read_mmap(
+            path.as_ref(),
+            AdviceSetting::from(Advice::Normal),
+            false,
+        )?)
     }
 
     #[inline]
@@ -101,7 +105,7 @@ pub struct CsrIter<'a> {
     row: usize,
 }
 
-impl<'a> Iterator for CsrIter<'a> {
+impl Iterator for CsrIter<'_> {
     type Item = Result<SparseVector, ValidationErrors>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -113,7 +117,7 @@ impl<'a> Iterator for CsrIter<'a> {
     }
 }
 
-impl<'a> ExactSizeIterator for CsrIter<'a> {
+impl ExactSizeIterator for CsrIter<'_> {
     fn len(&self) -> usize {
         self.csr.nrow - self.row
     }

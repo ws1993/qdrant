@@ -4,9 +4,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use bitvec::prelude::BitSlice;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::counter::hardware_counter::HardwareCounterCell;
 use sparse::common::types::{DimId, DimWeight};
 
 use crate::data_types::tiny_map;
+use crate::types::{VectorName, VectorNameBuf};
 
 #[derive(Debug)]
 pub struct QueryContext {
@@ -24,17 +27,24 @@ pub struct QueryContext {
     /// Statistics of the element frequency,
     /// collected over all segments.
     /// Required for processing sparse vector search with `idf-dot` similarity.
-    #[allow(dead_code)]
-    idf: tiny_map::TinyMap<String, HashMap<DimId, usize>>,
+    idf: tiny_map::TinyMap<VectorNameBuf, HashMap<DimId, usize>>,
+
+    /// Structure to accumulate and report hardware usage.
+    /// Holds reference to the shared drain, which is used to accumulate the values.
+    hardware_usage_accumulator: HwMeasurementAcc,
 }
 
 impl QueryContext {
-    pub fn new(search_optimized_threshold_kb: usize) -> Self {
+    pub fn new(
+        search_optimized_threshold_kb: usize,
+        hardware_usage_accumulator: HwMeasurementAcc,
+    ) -> Self {
         Self {
             available_point_count: 0,
             search_optimized_threshold_kb,
             is_stopped: Arc::new(AtomicBool::new(false)),
             idf: tiny_map::TinyMap::new(),
+            hardware_usage_accumulator,
         }
     }
 
@@ -61,12 +71,12 @@ impl QueryContext {
 
     /// Fill indices of sparse vectors, which are required for `idf-dot` similarity
     /// with zeros, so the statistics can be collected.
-    pub fn init_idf(&mut self, vector_name: &str, indices: &[DimId]) {
+    pub fn init_idf(&mut self, vector_name: &VectorName, indices: &[DimId]) {
         // ToDo: Would be nice to have an implementation of `entry` for `TinyMap`.
         let idf = if let Some(idf) = self.idf.get_mut(vector_name) {
             idf
         } else {
-            self.idf.insert(vector_name.to_string(), HashMap::default());
+            self.idf.insert(vector_name.to_owned(), HashMap::default());
             self.idf.get_mut(vector_name).unwrap()
         };
 
@@ -75,52 +85,67 @@ impl QueryContext {
         }
     }
 
-    pub fn mut_idf(&mut self) -> &mut tiny_map::TinyMap<String, HashMap<DimId, usize>> {
+    pub fn mut_idf(&mut self) -> &mut tiny_map::TinyMap<VectorNameBuf, HashMap<DimId, usize>> {
         &mut self.idf
     }
 
     pub fn get_segment_query_context(&self) -> SegmentQueryContext {
         SegmentQueryContext {
-            query_context: Some(self),
+            query_context: self,
             deleted_points: None,
+            hardware_counter: HardwareCounterCell::new_with_accumulator(
+                self.hardware_usage_accumulator.clone(),
+            ),
         }
+    }
+
+    pub fn hardware_usage_accumulator(&self) -> &HwMeasurementAcc {
+        &self.hardware_usage_accumulator
     }
 }
 
+#[cfg(feature = "testing")]
 impl Default for QueryContext {
     fn default() -> Self {
-        Self::new(usize::MAX) // Search optimized threshold won't affect the search.
+        Self::new(usize::MAX, HwMeasurementAcc::new()) // Search optimized threshold won't affect the search.
     }
 }
 
 /// Defines context of the search query on the segment level
-#[derive(Default, Clone, Debug)]
+#[derive(Debug)]
 pub struct SegmentQueryContext<'a> {
-    query_context: Option<&'a QueryContext>,
+    query_context: &'a QueryContext,
     deleted_points: Option<&'a BitSlice>,
+    hardware_counter: HardwareCounterCell,
 }
 
 impl<'a> SegmentQueryContext<'a> {
-    pub fn get_vector_context(&self, vector_name: &str) -> VectorQueryContext {
-        if let Some(query_context) = self.query_context {
-            VectorQueryContext {
-                available_point_count: query_context.available_point_count,
-                search_optimized_threshold_kb: query_context.search_optimized_threshold_kb,
-                is_stopped: Some(&query_context.is_stopped),
-                idf: query_context.idf.get(vector_name),
-                deleted_points: self.deleted_points,
-            }
-        } else {
-            VectorQueryContext {
-                deleted_points: self.deleted_points,
-                ..Default::default()
-            }
+    pub fn available_point_count(&self) -> usize {
+        self.query_context.available_point_count()
+    }
+
+    pub fn get_vector_context(&self, vector_name: &VectorName) -> VectorQueryContext {
+        VectorQueryContext {
+            available_point_count: self.query_context.available_point_count,
+            search_optimized_threshold_kb: self.query_context.search_optimized_threshold_kb,
+            is_stopped: Some(&self.query_context.is_stopped),
+            idf: self.query_context.idf.get(vector_name),
+            deleted_points: self.deleted_points,
+            hardware_counter: self.hardware_counter.fork(),
         }
     }
 
     pub fn with_deleted_points(mut self, deleted_points: &'a BitSlice) -> Self {
         self.deleted_points = Some(deleted_points);
         self
+    }
+
+    pub fn fork(&self) -> Self {
+        Self {
+            query_context: self.query_context,
+            deleted_points: self.deleted_points,
+            hardware_counter: self.hardware_counter.fork(),
+        }
     }
 }
 
@@ -139,6 +164,8 @@ pub struct VectorQueryContext<'a> {
     idf: Option<&'a HashMap<DimId, usize>>,
 
     deleted_points: Option<&'a BitSlice>,
+
+    hardware_counter: HardwareCounterCell,
 }
 
 pub enum SimpleCow<'a, T> {
@@ -146,7 +173,7 @@ pub enum SimpleCow<'a, T> {
     Owned(T),
 }
 
-impl<'a, T> Deref for SimpleCow<'a, T> {
+impl<T> Deref for SimpleCow<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -158,6 +185,10 @@ impl<'a, T> Deref for SimpleCow<'a, T> {
 }
 
 impl VectorQueryContext<'_> {
+    pub fn hardware_counter(&self) -> HardwareCounterCell {
+        self.hardware_counter.fork()
+    }
+
     pub fn available_point_count(&self) -> usize {
         self.available_point_count
     }
@@ -203,6 +234,7 @@ impl VectorQueryContext<'_> {
     }
 }
 
+#[cfg(feature = "testing")]
 impl Default for VectorQueryContext<'_> {
     fn default() -> Self {
         VectorQueryContext {
@@ -211,6 +243,7 @@ impl Default for VectorQueryContext<'_> {
             is_stopped: None,
             idf: None,
             deleted_points: None,
+            hardware_counter: HardwareCounterCell::new(),
         }
     }
 }

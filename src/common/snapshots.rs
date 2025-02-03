@@ -1,9 +1,8 @@
-use std::fmt;
-use std::path::Path;
 use std::sync::Arc;
 
 use collection::collection::Collection;
 use collection::common::sha_256::hash_file;
+use collection::common::snapshot_stream::SnapshotStream;
 use collection::operations::snapshot_ops::{
     ShardSnapshotLocation, SnapshotDescription, SnapshotPriority,
 };
@@ -25,8 +24,10 @@ pub async fn create_shard_snapshot(
     collection_name: String,
     shard_id: ShardId,
 ) -> Result<SnapshotDescription, StorageError> {
-    let collection_pass = access
-        .check_collection_access(&collection_name, AccessRequirements::new().write().whole())?;
+    let collection_pass = access.check_collection_access(
+        &collection_name,
+        AccessRequirements::new().write().whole().extras(),
+    )?;
     let collection = toc.get_collection(&collection_pass).await?;
 
     let snapshot = collection
@@ -39,14 +40,34 @@ pub async fn create_shard_snapshot(
 /// # Cancel safety
 ///
 /// This function is cancel safe.
+pub async fn stream_shard_snapshot(
+    toc: Arc<TableOfContent>,
+    access: Access,
+    collection_name: String,
+    shard_id: ShardId,
+) -> Result<SnapshotStream, StorageError> {
+    let collection_pass = access.check_collection_access(
+        &collection_name,
+        AccessRequirements::new().write().whole().extras(),
+    )?;
+    let collection = toc.get_collection(&collection_pass).await?;
+
+    Ok(collection
+        .stream_shard_snapshot(shard_id, &toc.optional_temp_or_snapshot_temp_path()?)
+        .await?)
+}
+
+/// # Cancel safety
+///
+/// This function is cancel safe.
 pub async fn list_shard_snapshots(
     toc: Arc<TableOfContent>,
     access: Access,
     collection_name: String,
     shard_id: ShardId,
 ) -> Result<Vec<SnapshotDescription>, StorageError> {
-    let collection_pass =
-        access.check_collection_access(&collection_name, AccessRequirements::new().whole())?;
+    let collection_pass = access
+        .check_collection_access(&collection_name, AccessRequirements::new().whole().extras())?;
     let collection = toc.get_collection(&collection_pass).await?;
     let snapshots = collection.list_shard_snapshots(shard_id).await?;
     Ok(snapshots)
@@ -62,16 +83,21 @@ pub async fn delete_shard_snapshot(
     shard_id: ShardId,
     snapshot_name: String,
 ) -> Result<(), StorageError> {
-    let collection_pass = access
-        .check_collection_access(&collection_name, AccessRequirements::new().write().whole())?;
+    let collection_pass = access.check_collection_access(
+        &collection_name,
+        AccessRequirements::new().write().whole().extras(),
+    )?;
     let collection = toc.get_collection(&collection_pass).await?;
-    let snapshot_path = collection
-        .get_shard_snapshot_path(shard_id, &snapshot_name)
-        .await?;
-    let snapshot_manager = collection.get_snapshots_storage_manager();
-    check_shard_snapshot_file_exists(&snapshot_path)?;
+    let snapshot_manager = collection.get_snapshots_storage_manager()?;
 
-    let _task = tokio::spawn(async move { snapshot_manager.delete_snapshot(&snapshot_path).await });
+    let snapshot_path = collection
+        .shards_holder()
+        .read()
+        .await
+        .get_shard_snapshot_path(collection.snapshots_path(), shard_id, &snapshot_name)
+        .await?;
+
+    tokio::spawn(async move { snapshot_manager.delete_snapshot(&snapshot_path).await }).await??;
 
     Ok(())
 }
@@ -96,8 +122,6 @@ pub async fn recover_shard_snapshot(
         .issue_pass(&collection_name)
         .into_static();
 
-    // - `download_dir` handled by `tempfile` and would be deleted, if request is cancelled
-    //   - remote snapshot is downloaded into `download_dir` and would be deleted with it
     // - `recover_shard_snapshot_impl` is *not* cancel safe
     //   - but the task is *spawned* on the runtime and won't be cancelled, if request is cancelled
 
@@ -106,9 +130,9 @@ pub async fn recover_shard_snapshot(
             let collection = toc.get_collection(&collection_pass).await?;
             collection.assert_shard_exists(shard_id).await?;
 
-            let download_dir = toc.snapshots_download_tempdir()?;
+            let download_dir = toc.optional_temp_or_snapshot_temp_path()?;
 
-            let (snapshot_path, snapshot_temp_path) = match snapshot_location {
+            let snapshot_path = match snapshot_location {
                 ShardSnapshotLocation::Url(url) => {
                     if !matches!(url.scheme(), "http" | "https") {
                         let description = format!(
@@ -121,17 +145,25 @@ pub async fn recover_shard_snapshot(
 
                     let client = client.client(api_key.as_deref())?;
 
-                    let (snapshot_path, snapshot_temp_path) =
-                        snapshots::download::download_snapshot(&client, url, download_dir.path())
-                            .await?;
-
-                    (snapshot_path, snapshot_temp_path)
+                    snapshots::download::download_snapshot(&client, url, &download_dir).await?
                 }
 
-                ShardSnapshotLocation::Path(path) => {
-                    let snapshot_path = collection.get_shard_snapshot_path(shard_id, path).await?;
-                    check_shard_snapshot_file_exists(&snapshot_path)?;
-                    (snapshot_path, None)
+                ShardSnapshotLocation::Path(snapshot_file_name) => {
+                    let snapshot_path = collection
+                        .shards_holder()
+                        .read()
+                        .await
+                        .get_shard_snapshot_path(
+                            collection.snapshots_path(),
+                            shard_id,
+                            &snapshot_file_name,
+                        )
+                        .await?;
+
+                    collection
+                        .get_snapshots_storage_manager()?
+                        .get_snapshot_file(&snapshot_path, &download_dir)
+                        .await?
                 }
             };
 
@@ -144,15 +176,10 @@ pub async fn recover_shard_snapshot(
                 }
             }
 
-            Result::<_, StorageError>::Ok((
-                collection,
-                download_dir,
-                snapshot_path,
-                snapshot_temp_path,
-            ))
+            Result::<_, StorageError>::Ok((collection, snapshot_path))
         };
 
-        let (collection, _download_dir, snapshot_path, snapshot_temp_path) =
+        let (collection, snapshot_path) =
             cancel::future::cancel_on_token(cancel.clone(), future).await??;
 
         // `recover_shard_snapshot_impl` is *not* cancel safe
@@ -167,10 +194,8 @@ pub async fn recover_shard_snapshot(
         .await;
 
         // Remove snapshot after recovery if downloaded
-        if let Some(path) = snapshot_temp_path {
-            if let Err(err) = path.close() {
-                log::error!("Failed to remove downloaded shards snapshot after recovery: {err}");
-            }
+        if let Err(err) = snapshot_path.close() {
+            log::error!("Failed to remove downloaded shards snapshot after recovery: {err}");
         }
 
         result
@@ -218,7 +243,17 @@ pub async fn recover_shard_snapshot_impl(
         .replicas
         .iter()
         .map(|(&peer, &state)| (peer, state))
-        .filter(|&(peer, state)| peer != toc.this_peer_id && state == ReplicaState::Active)
+        .filter(|&(peer, state)| {
+            // Check if there are *other* active replicas, after recovering shard snapshot.
+            // This should include `ReshardingScaleDown` replicas.
+
+            let is_active = matches!(
+                state,
+                ReplicaState::Active | ReplicaState::ReshardingScaleDown
+            );
+
+            peer != toc.this_peer_id && is_active
+        })
         .collect();
 
     if other_active_replicas.is_empty() {
@@ -262,23 +297,4 @@ pub async fn recover_shard_snapshot_impl(
     }
 
     Ok(())
-}
-
-fn check_shard_snapshot_file_exists(snapshot_path: &Path) -> Result<(), StorageError> {
-    let snapshot_path_display = snapshot_path.display();
-    let snapshot_file_name = snapshot_path.file_name().and_then(|str| str.to_str());
-
-    let snapshot: &dyn fmt::Display = snapshot_file_name
-        .as_ref()
-        .map_or(&snapshot_path_display, |str| str);
-
-    if !snapshot_path.exists() {
-        let description = format!("Snapshot {snapshot} not found");
-        Err(StorageError::NotFound { description })
-    } else if !snapshot_path.is_file() {
-        let description = format!("{snapshot} is not a file");
-        Err(StorageError::service_error(description))
-    } else {
-        Ok(())
-    }
 }

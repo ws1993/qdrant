@@ -94,7 +94,7 @@ impl TransferTasksPool {
                     "Transfer of shard {}:{} -> {} finished",
                     self.collection_id,
                     transfer_key.shard_id,
-                    transfer_key.to
+                    transfer_key.to,
                 );
                 TaskResult::Finished
             }
@@ -103,17 +103,16 @@ impl TransferTasksPool {
                     "Transfer of shard {}:{} -> {} stopped",
                     self.collection_id,
                     transfer_key.shard_id,
-                    transfer_key.to
+                    transfer_key.to,
                 );
                 TaskResult::Failed
             }
             Err(err) => {
                 log::warn!(
-                    "Transfer task for shard {}:{} -> {} failed: {}",
+                    "Transfer task for shard {}:{} -> {} failed: {err}",
                     self.collection_id,
                     transfer_key.shard_id,
                     transfer_key.to,
-                    err
                 );
                 TaskResult::Failed
             }

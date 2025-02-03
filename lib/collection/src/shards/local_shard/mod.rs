@@ -1,19 +1,27 @@
 pub mod clock_map;
-mod shard_ops;
+pub mod disk_usage_watcher;
+pub(super) mod facet;
+pub(super) mod query;
+pub(super) mod scroll;
+pub(super) mod search;
+pub(super) mod shard_ops;
 
 use std::collections::{BTreeSet, HashMap};
 use std::mem::size_of;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::cpu::CpuBudget;
-use common::panic;
+use common::rate_limiting::RateLimiter;
 use common::types::TelemetryDetail;
+use common::{panic, tar_ext};
 use indicatif::{ProgressBar, ProgressStyle};
 use itertools::Itertools;
 use parking_lot::{Mutex as ParkingMutex, RwLock};
@@ -23,34 +31,39 @@ use segment::index::field_index::CardinalityEstimation;
 use segment::segment::Segment;
 use segment::segment_constructor::{build_segment, load_segment};
 use segment::types::{
-    CompressionRatio, Filter, PayloadIndexInfo, PayloadKeyType, PayloadStorageType, PointIdType,
-    QuantizationConfig, SegmentConfig, SegmentType,
+    CompressionRatio, Filter, PayloadIndexInfo, PayloadKeyType, PointIdType, QuantizationConfig,
+    SegmentConfig, SegmentType, SnapshotFormat,
 };
 use segment::utils::mem::Mem;
-use tokio::fs::{copy, create_dir_all, remove_dir_all, remove_file};
+use segment::vector_storage::common::get_async_scorer;
+use tokio::fs::{create_dir_all, remove_dir_all, remove_file};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc::Sender;
 use tokio::sync::{mpsc, oneshot, Mutex, RwLock as TokioRwLock};
 use wal::{Wal, WalOptions};
 
 use self::clock_map::{ClockMap, RecoveryPoint};
+use self::disk_usage_watcher::DiskUsageWatcher;
 use super::update_tracker::UpdateTracker;
+use crate::collection::payload_index_schema::PayloadIndexSchema;
 use crate::collection_manager::collection_updater::CollectionUpdater;
 use crate::collection_manager::holders::segment_holder::{
     LockedSegment, LockedSegmentHolder, SegmentHolder,
 };
 use crate::collection_manager::optimizers::TrackerLog;
+use crate::collection_manager::segments_searcher::SegmentsSearcher;
 use crate::common::file_utils::{move_dir, move_file};
-use crate::config::CollectionConfig;
+use crate::config::CollectionConfigInternal;
 use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::types::{
-    check_sparse_compatible_with_segment_config, CollectionError, CollectionInfoInternal,
-    CollectionResult, CollectionStatus, OptimizersStatus,
+    check_sparse_compatible_with_segment_config, CollectionError, CollectionResult,
+    OptimizersStatus, ShardInfoInternal, ShardStatus,
 };
 use crate::operations::OperationWithClockTag;
-use crate::optimizers_builder::{build_optimizers, clear_temp_segments};
+use crate::optimizers_builder::{build_optimizers, clear_temp_segments, OptimizersConfig};
+use crate::save_on_disk::SaveOnDisk;
 use crate::shards::shard::ShardId;
-use crate::shards::shard_config::{ShardConfig, SHARD_CONFIG_FILE};
+use crate::shards::shard_config::ShardConfig;
 use crate::shards::telemetry::{LocalShardTelemetry, OptimizerTelemetry};
 use crate::shards::CollectionId;
 use crate::update_handler::{Optimizer, UpdateHandler, UpdateSignal};
@@ -60,6 +73,14 @@ use crate::wal_delta::{LockedWal, RecoverableWal};
 /// If rendering WAL load progression in basic text form, report progression every 60 seconds.
 const WAL_LOAD_REPORT_EVERY: Duration = Duration::from_secs(60);
 
+const WAL_PATH: &str = "wal";
+
+const SEGMENTS_PATH: &str = "segments";
+
+const NEWEST_CLOCKS_PATH: &str = "newest_clocks.json";
+
+const OLDEST_CLOCKS_PATH: &str = "oldest_clocks.json";
+
 /// LocalShard
 ///
 /// LocalShard is an entity that can be moved between peers and contains some part of one collections data.
@@ -67,8 +88,9 @@ const WAL_LOAD_REPORT_EVERY: Duration = Duration::from_secs(60);
 /// Holds all object, required for collection functioning
 pub struct LocalShard {
     pub(super) segments: LockedSegmentHolder,
-    pub(super) collection_config: Arc<TokioRwLock<CollectionConfig>>,
+    pub(super) collection_config: Arc<TokioRwLock<CollectionConfigInternal>>,
     pub(super) shared_storage_config: Arc<SharedStorageConfig>,
+    pub(crate) payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
     pub(super) wal: RecoverableWal,
     pub(super) update_handler: Arc<Mutex<UpdateHandler>>,
     pub(super) update_sender: ArcSwap<Sender<UpdateSignal>>,
@@ -76,7 +98,11 @@ pub struct LocalShard {
     pub(super) path: PathBuf,
     pub(super) optimizers: Arc<Vec<Arc<Optimizer>>>,
     pub(super) optimizers_log: Arc<ParkingMutex<TrackerLog>>,
+    pub(super) total_optimized_points: Arc<AtomicUsize>,
     update_runtime: Handle,
+    pub(super) search_runtime: Handle,
+    disk_usage_watcher: DiskUsageWatcher,
+    read_rate_limiter: Option<ParkingMutex<RateLimiter>>,
 }
 
 /// Shard holds information about segments and WAL.
@@ -126,24 +152,39 @@ impl LocalShard {
     #[allow(clippy::too_many_arguments)]
     pub async fn new(
         segment_holder: SegmentHolder,
-        collection_config: Arc<TokioRwLock<CollectionConfig>>,
+        collection_config: Arc<TokioRwLock<CollectionConfigInternal>>,
         shared_storage_config: Arc<SharedStorageConfig>,
+        payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         wal: SerdeWal<OperationWithClockTag>,
         optimizers: Arc<Vec<Arc<Optimizer>>>,
         optimizer_cpu_budget: CpuBudget,
         shard_path: &Path,
         clocks: LocalShardClocks,
         update_runtime: Handle,
+        search_runtime: Handle,
     ) -> Self {
         let segment_holder = Arc::new(RwLock::new(segment_holder));
         let config = collection_config.read().await;
         let locked_wal = Arc::new(ParkingMutex::new(wal));
         let optimizers_log = Arc::new(ParkingMutex::new(Default::default()));
+        let total_optimized_points = Arc::new(AtomicUsize::new(0));
+
+        // default to 2x the WAL capacity
+        let disk_buffer_threshold_mb =
+            2 * (collection_config.read().await.wal_config.wal_capacity_mb);
+
+        let disk_usage_watcher = disk_usage_watcher::DiskUsageWatcher::new(
+            shard_path.to_owned(),
+            disk_buffer_threshold_mb,
+        )
+        .await;
 
         let mut update_handler = UpdateHandler::new(
             shared_storage_config.clone(),
+            payload_index_schema.clone(),
             optimizers.clone(),
             optimizers_log.clone(),
+            total_optimized_points.clone(),
             optimizer_cpu_budget.clone(),
             update_runtime.clone(),
             segment_holder.clone(),
@@ -160,20 +201,32 @@ impl LocalShard {
 
         let update_tracker = segment_holder.read().update_tracker();
 
+        let read_rate_limiter = config.strict_mode_config.as_ref().and_then(|strict_mode| {
+            strict_mode
+                .read_rate_limit
+                .map(RateLimiter::new_per_minute)
+                .map(ParkingMutex::new)
+        });
+
         drop(config); // release `shared_config` from borrow checker
 
         Self {
             segments: segment_holder,
             collection_config,
             shared_storage_config,
+            payload_index_schema,
             wal: RecoverableWal::new(locked_wal, clocks.newest_clocks, clocks.oldest_clocks),
             update_handler: Arc::new(Mutex::new(update_handler)),
             update_sender: ArcSwap::from_pointee(update_sender),
             update_tracker,
             path: shard_path.to_owned(),
             update_runtime,
+            search_runtime,
             optimizers,
             optimizers_log,
+            total_optimized_points,
+            disk_usage_watcher,
+            read_rate_limiter,
         }
     }
 
@@ -182,13 +235,17 @@ impl LocalShard {
     }
 
     /// Recovers shard from disk.
+    #[allow(clippy::too_many_arguments)]
     pub async fn load(
         id: ShardId,
         collection_id: CollectionId,
         shard_path: &Path,
-        collection_config: Arc<TokioRwLock<CollectionConfig>>,
+        collection_config: Arc<TokioRwLock<CollectionConfigInternal>>,
+        effective_optimizers_config: OptimizersConfig,
         shared_storage_config: Arc<SharedStorageConfig>,
+        payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         update_runtime: Handle,
+        search_runtime: Handle,
         optimizer_cpu_budget: CpuBudget,
     ) -> CollectionResult<LocalShard> {
         let collection_config_read = collection_config.read().await;
@@ -218,6 +275,7 @@ impl LocalShard {
 
         for entry in segment_dirs {
             let segments_path = entry.unwrap().path();
+            let payload_index_schema = payload_index_schema.clone();
             // let semaphore_clone = semaphore.clone();
             load_handlers.push(
                 thread::Builder::new()
@@ -227,12 +285,14 @@ impl LocalShard {
                         let mut res = load_segment(&segments_path, &AtomicBool::new(false))?;
                         if let Some(segment) = &mut res {
                             segment.check_consistency_and_repair()?;
+                            segment.update_all_field_indices(
+                                &payload_index_schema.read().schema.clone(),
+                            )?;
                         } else {
                             std::fs::remove_dir_all(&segments_path).map_err(|err| {
                                 CollectionError::service_error(format!(
-                                    "Can't remove leftover segment {}, due to {}",
+                                    "Can't remove leftover segment {}, due to {err}",
                                     segments_path.to_str().unwrap(),
-                                    err
                                 ))
                             })?;
                         }
@@ -272,10 +332,10 @@ impl LocalShard {
                 })
                 .unwrap_or(Ok(()))?;
 
-            segment_holder.add(segment);
+            segment_holder.add_new(segment);
         }
 
-        let res = segment_holder.deduplicate_points()?;
+        let res = segment_holder.deduplicate_points().await?;
         if res > 0 {
             log::debug!("Deduplicated {} points", res);
         }
@@ -284,7 +344,7 @@ impl LocalShard {
         let optimizers = build_optimizers(
             shard_path,
             &collection_config_read.params,
-            &collection_config_read.optimizer_config,
+            &effective_optimizers_config,
             &collection_config_read.hnsw_config,
             &collection_config_read.quantization_config,
         );
@@ -293,19 +353,39 @@ impl LocalShard {
 
         let clocks = LocalShardClocks::load(shard_path)?;
 
+        // Always make sure we have any appendable segments, needed for update operations
+        if !segment_holder.has_appendable_segment() {
+            debug_assert!(
+                false,
+                "Shard has no appendable segments, this should never happen",
+            );
+            log::warn!("Shard has no appendable segments, this should never happen. Creating new appendable segment now");
+            let segments_path = LocalShard::segments_path(shard_path);
+            let collection_params = collection_config.read().await.params.clone();
+            let payload_index_schema = payload_index_schema.read();
+            segment_holder.create_appendable_segment(
+                &segments_path,
+                &collection_params,
+                &payload_index_schema,
+            )?;
+        }
+
         let local_shard = LocalShard::new(
             segment_holder,
             collection_config,
             shared_storage_config,
+            payload_index_schema,
             wal,
             optimizers,
             optimizer_cpu_budget,
             shard_path,
             clocks,
             update_runtime,
+            search_runtime,
         )
         .await;
 
+        // Apply outstanding operations from WAL
         local_shard.load_from_wal(collection_id).await?;
 
         let available_memory_bytes = Mem::new().available_memory_bytes() as usize;
@@ -337,21 +417,25 @@ impl LocalShard {
     }
 
     pub fn wal_path(shard_path: &Path) -> PathBuf {
-        shard_path.join("wal")
+        shard_path.join(WAL_PATH)
     }
 
     pub fn segments_path(shard_path: &Path) -> PathBuf {
-        shard_path.join("segments")
+        shard_path.join(SEGMENTS_PATH)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_local(
         id: ShardId,
         collection_id: CollectionId,
         shard_path: &Path,
-        collection_config: Arc<TokioRwLock<CollectionConfig>>,
+        collection_config: Arc<TokioRwLock<CollectionConfigInternal>>,
         shared_storage_config: Arc<SharedStorageConfig>,
+        payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         update_runtime: Handle,
+        search_runtime: Handle,
         optimizer_cpu_budget: CpuBudget,
+        effective_optimizers_config: OptimizersConfig,
     ) -> CollectionResult<LocalShard> {
         // initialize local shard config file
         let local_shard_config = ShardConfig::new_replica_set();
@@ -361,8 +445,11 @@ impl LocalShard {
             shard_path,
             collection_config,
             shared_storage_config,
+            payload_index_schema,
             update_runtime,
+            search_runtime,
             optimizer_cpu_budget,
+            effective_optimizers_config,
         )
         .await?;
         local_shard_config.save(shard_path)?;
@@ -370,18 +457,22 @@ impl LocalShard {
     }
 
     /// Creates new empty shard with given configuration, initializing all storages, optimizers and directories.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build(
         id: ShardId,
         collection_id: CollectionId,
         shard_path: &Path,
-        collection_config: Arc<TokioRwLock<CollectionConfig>>,
+        collection_config: Arc<TokioRwLock<CollectionConfigInternal>>,
         shared_storage_config: Arc<SharedStorageConfig>,
+        payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
         update_runtime: Handle,
+        search_runtime: Handle,
         optimizer_cpu_budget: CpuBudget,
+        effective_optimizers_config: OptimizersConfig,
     ) -> CollectionResult<LocalShard> {
         let config = collection_config.read().await;
 
-        let wal_path = shard_path.join("wal");
+        let wal_path = Self::wal_path(shard_path);
 
         create_dir_all(&wal_path).await.map_err(|err| {
             CollectionError::service_error(format!(
@@ -389,7 +480,7 @@ impl LocalShard {
             ))
         })?;
 
-        let segments_path = shard_path.join("segments");
+        let segments_path = Self::segments_path(shard_path);
 
         create_dir_all(&segments_path).await.map_err(|err| {
             CollectionError::service_error(format!(
@@ -409,11 +500,7 @@ impl LocalShard {
             let segment_config = SegmentConfig {
                 vector_data: vector_params.clone(),
                 sparse_vector_data: sparse_vector_params.clone(),
-                payload_storage_type: if config.params.on_disk_payload {
-                    PayloadStorageType::OnDisk
-                } else {
-                    PayloadStorageType::InMemory
-                },
+                payload_storage_type: config.params.payload_storage_type(),
             };
             let segment = thread::Builder::new()
                 .name(format!("shard-build-{collection_id}-{id}"))
@@ -437,7 +524,7 @@ impl LocalShard {
                 ))
             })??;
 
-            segment_holder.add(segment);
+            segment_holder.add_new(segment);
         }
 
         let wal: SerdeWal<OperationWithClockTag> =
@@ -446,7 +533,7 @@ impl LocalShard {
         let optimizers = build_optimizers(
             shard_path,
             &config.params,
-            &config.optimizer_config,
+            &effective_optimizers_config,
             &config.hnsw_config,
             &config.quantization_config,
         );
@@ -457,12 +544,14 @@ impl LocalShard {
             segment_holder,
             collection_config,
             shared_storage_config,
+            payload_index_schema,
             wal,
             optimizers,
             optimizer_cpu_budget,
             shard_path,
             LocalShardClocks::default(),
             update_runtime,
+            search_runtime,
         )
         .await;
 
@@ -489,6 +578,12 @@ impl LocalShard {
             .template("{msg} [{elapsed_precise}] {wide_bar} {pos}/{len} (eta:{eta})")
             .expect("Failed to create progress style");
         bar.set_style(progress_style);
+
+        log::debug!(
+            "Recovering shard {:?} starting reading WAL from {}",
+            &self.path,
+            wal.first_index()
+        );
 
         bar.set_message(format!("Recovering collection {collection_id}"));
         let segments = self.segments();
@@ -522,7 +617,12 @@ impl LocalShard {
             }
 
             // Propagate `CollectionError::ServiceError`, but skip other error types.
-            match &CollectionUpdater::update(segments, op_num, update.operation) {
+            match &CollectionUpdater::update(
+                segments,
+                op_num,
+                update.operation,
+                &HardwareCounterCell::disposable(), // Internal operation, no measurement needed.
+            ) {
                 Err(err @ CollectionError::ServiceError { error, backtrace }) => {
                     let path = self.path.display();
 
@@ -577,7 +677,11 @@ impl LocalShard {
                     }
                 }
             }
-            segments.flush_all(true)?;
+
+            // Force a flush after re-applying WAL operations, to ensure we maintain on-disk data
+            // consistency, if we happened to only apply *past* operations to a segment with newer
+            // version.
+            segments.flush_all(true, true)?;
         }
 
         bar.finish();
@@ -588,6 +692,39 @@ impl LocalShard {
             );
         }
 
+        // The storage is expected to be consistent after WAL recovery
+        #[cfg(feature = "data-consistency-check")]
+        self.check_data_consistency()?;
+
+        Ok(())
+    }
+
+    /// Check data consistency for all segments
+    ///
+    /// Returns an error at the first inconsistent segment
+    pub fn check_data_consistency(&self) -> CollectionResult<()> {
+        log::info!("Checking data consistency for shard {:?}", self.path);
+        let segments = self.segments.read();
+        for (_idx, segment) in segments.iter() {
+            match segment {
+                LockedSegment::Original(raw_segment) => {
+                    let segment_guard = raw_segment.read();
+                    if let Err(err) = segment_guard.check_data_consistency() {
+                        log::error!(
+                            "Segment {:?} is inconsistent: {}",
+                            segment_guard.current_path,
+                            err
+                        );
+                        return Err(err.into());
+                    }
+                }
+                LockedSegment::Proxy(_) => {
+                    return Err(CollectionError::service_error(
+                        "Proxy segment found in check_data_consistency",
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 
@@ -614,9 +751,38 @@ impl LocalShard {
         update_handler.flush_interval_sec = config.optimizer_config.flush_interval_sec;
         update_handler.max_optimization_threads = config.optimizer_config.max_optimization_threads;
         update_handler.run_workers(update_receiver);
+
         self.update_sender.load().send(UpdateSignal::Nop).await?;
 
         Ok(())
+    }
+
+    /// Apply shard's strict mode configuration update
+    /// - Update read rate limiter
+    pub async fn on_strict_mode_config_update(&mut self) {
+        let config = self.collection_config.read().await;
+
+        if let Some(strict_mode_config) = &config.strict_mode_config {
+            if strict_mode_config.enabled == Some(true) {
+                // update read rate limiter
+                if let Some(read_rate_limit_per_min) = strict_mode_config.read_rate_limit {
+                    let new_read_rate_limiter =
+                        RateLimiter::new_per_minute(read_rate_limit_per_min);
+                    self.read_rate_limiter
+                        .replace(parking_lot::Mutex::new(new_read_rate_limiter));
+                    return;
+                }
+            }
+        }
+        // remove read rate limiter for all other situations
+        self.read_rate_limiter.take();
+    }
+
+    pub fn trigger_optimizers(&self) {
+        // Send a trigger signal and ignore errors because all error cases are acceptable:
+        // - If receiver is already dead - we do not care
+        // - If channel is full - optimization will be triggered by some other signal
+        let _ = self.update_sender.load().try_send(UpdateSignal::Nop);
     }
 
     /// Finishes ongoing update tasks
@@ -633,25 +799,14 @@ impl LocalShard {
     }
 
     pub fn restore_snapshot(snapshot_path: &Path) -> CollectionResult<()> {
-        // recover segments
-        let segments_path = LocalShard::segments_path(snapshot_path);
-        // iterate over segments directory and recover each segment
-        for entry in std::fs::read_dir(segments_path)? {
-            let entry_path = entry?.path();
-            if entry_path.extension().map(|s| s == "tar").unwrap_or(false) {
-                let segment_id_opt = entry_path
-                    .file_stem()
-                    .map(|s| s.to_str().unwrap().to_owned());
-                if segment_id_opt.is_none() {
-                    return Err(CollectionError::service_error(
-                        "Segment ID is empty".to_string(),
-                    ));
-                }
-                let segment_id = segment_id_opt.unwrap();
-                Segment::restore_snapshot(&entry_path, &segment_id)?;
-                std::fs::remove_file(&entry_path)?;
-            }
+        // Read dir first as the directory contents would change during restore.
+        let entries = std::fs::read_dir(LocalShard::segments_path(snapshot_path))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for entry in entries {
+            Segment::restore_snapshot_in_place(&entry.path())?;
         }
+
         Ok(())
     }
 
@@ -659,18 +814,12 @@ impl LocalShard {
     pub async fn create_snapshot(
         &self,
         temp_path: &Path,
-        target_path: &Path,
+        tar: &tar_ext::BuilderExt,
+        format: SnapshotFormat,
         save_wal: bool,
     ) -> CollectionResult<()> {
-        let snapshot_shard_path = target_path;
-
-        // snapshot all shard's segment
-        let snapshot_segments_shard_path = snapshot_shard_path.join("segments");
-        create_dir_all(&snapshot_segments_shard_path).await?;
-
         let segments = self.segments.clone();
         let wal = self.wal.wal.clone();
-        let snapshot_shard_path_owned = snapshot_shard_path.to_owned();
 
         if !save_wal {
             // If we are not saving WAL, we still need to make sure that all submitted by this point
@@ -682,61 +831,57 @@ impl LocalShard {
             rx.await?;
         }
 
-        let collection_path = self.path.parent().map(Path::to_path_buf).ok_or_else(|| {
-            CollectionError::service_error("Failed to determine collection path for shard")
-        })?;
+        let segments_path = Self::segments_path(&self.path);
         let collection_params = self.collection_config.read().await.params.clone();
         let temp_path = temp_path.to_owned();
+        let payload_index_schema = self.payload_index_schema.clone();
 
+        let tar_c = tar.clone();
         tokio::task::spawn_blocking(move || {
             // Do not change segments while snapshotting
             SegmentHolder::snapshot_all_segments(
                 segments.clone(),
-                &collection_path,
+                &segments_path,
                 Some(&collection_params),
+                &payload_index_schema.read().clone(),
                 &temp_path,
-                &snapshot_segments_shard_path,
+                &tar_c.descend(Path::new(SEGMENTS_PATH))?,
+                format,
             )?;
 
             if save_wal {
                 // snapshot all shard's WAL
-                Self::snapshot_wal(wal, &snapshot_shard_path_owned)
+                Self::snapshot_wal(wal, &tar_c)
             } else {
-                Self::snapshot_empty_wal(wal, &snapshot_shard_path_owned)
+                Self::snapshot_empty_wal(wal, &temp_path, &tar_c)
             }
         })
         .await??;
 
-        LocalShardClocks::copy_data(&self.path, snapshot_shard_path).await?;
-
-        // copy shard's config
-        let shard_config_path = ShardConfig::get_config_path(&self.path);
-        let target_shard_config_path = snapshot_shard_path.join(SHARD_CONFIG_FILE);
-        copy(&shard_config_path, &target_shard_config_path).await?;
+        LocalShardClocks::archive_data(&self.path, tar).await?;
 
         Ok(())
     }
 
     /// Create empty WAL which is compatible with currently stored data
-    pub fn snapshot_empty_wal(wal: LockedWal, snapshot_shard_path: &Path) -> CollectionResult<()> {
+    pub fn snapshot_empty_wal(
+        wal: LockedWal,
+        temp_path: &Path,
+        tar: &tar_ext::BuilderExt,
+    ) -> CollectionResult<()> {
         let (segment_capacity, latest_op_num) = {
             let wal_guard = wal.lock();
             (wal_guard.segment_capacity(), wal_guard.last_index())
         };
 
-        let target_path = Self::wal_path(snapshot_shard_path);
-
-        // Create directory if it does not exist
-        std::fs::create_dir_all(&target_path).map_err(|err| {
+        let temp_dir = tempfile::tempdir_in(temp_path).map_err(|err| {
             CollectionError::service_error(format!(
-                "Can not crate directory {}: {}",
-                target_path.display(),
-                err
+                "Can not create temporary directory for WAL: {err}",
             ))
         })?;
 
         Wal::generate_empty_wal_starting_at_index(
-            target_path,
+            temp_dir.path(),
             &WalOptions {
                 segment_capacity,
                 segment_queue_len: 0,
@@ -745,23 +890,43 @@ impl LocalShard {
         )
         .map_err(|err| {
             CollectionError::service_error(format!("Error while create empty WAL: {err}"))
-        })
+        })?;
+
+        tar.blocking_append_dir_all(temp_dir.path(), Path::new(WAL_PATH))
+            .map_err(|err| {
+                CollectionError::service_error(format!("Error while archiving WAL: {err}"))
+            })
     }
 
     /// snapshot WAL
-    ///
-    /// copies all WAL files into `snapshot_shard_path/wal`
-    pub fn snapshot_wal(wal: LockedWal, snapshot_shard_path: &Path) -> CollectionResult<()> {
+    pub fn snapshot_wal(wal: LockedWal, tar: &tar_ext::BuilderExt) -> CollectionResult<()> {
         // lock wal during snapshot
         let mut wal_guard = wal.lock();
         wal_guard.flush()?;
         let source_wal_path = wal_guard.path();
-        let options = fs_extra::dir::CopyOptions::new();
-        fs_extra::dir::copy(source_wal_path, snapshot_shard_path, &options).map_err(|err| {
-            CollectionError::service_error(format!(
-                "Error while copy WAL {snapshot_shard_path:?} {err}"
-            ))
-        })?;
+
+        let tar = tar.descend(Path::new(WAL_PATH))?;
+        for entry in std::fs::read_dir(source_wal_path).map_err(|err| {
+            CollectionError::service_error(format!("Can't read WAL directory: {err}",))
+        })? {
+            let entry = entry.map_err(|err| {
+                CollectionError::service_error(format!("Can't read WAL directory: {err}",))
+            })?;
+
+            if entry.file_name() == ".wal" {
+                // This sentinel file is used for WAL locking. Trying to archive
+                // or open it will cause the following error on Windows:
+                // > The process cannot access the file because another process
+                // > has locked a portion of the file. (os error 33)
+                // https://github.com/qdrant/wal/blob/7c9202d0874/src/lib.rs#L125-L145
+                continue;
+            }
+
+            tar.blocking_append_file(&entry.path(), Path::new(&entry.file_name()))
+                .map_err(|err| {
+                    CollectionError::service_error(format!("Error while archiving WAL: {err}"))
+                })?;
+        }
         Ok(())
     }
 
@@ -770,11 +935,6 @@ impl LocalShard {
         filter: Option<&'a Filter>,
     ) -> CollectionResult<CardinalityEstimation> {
         let segments = self.segments().read();
-        let some_segment = segments.iter().next();
-
-        if some_segment.is_none() {
-            return Ok(CardinalityEstimation::exact(0));
-        }
         let cardinality = segments
             .iter()
             .map(|(_id, segment)| segment.get().read().estimate_point_count(filter))
@@ -789,16 +949,14 @@ impl LocalShard {
         Ok(cardinality)
     }
 
-    pub fn read_filtered<'a>(
+    pub async fn read_filtered<'a>(
         &'a self,
         filter: Option<&'a Filter>,
+        runtime_handle: &Handle,
+        hw_counter: HwMeasurementAcc,
     ) -> CollectionResult<BTreeSet<PointIdType>> {
-        let segments = self.segments().read();
-        let all_points: BTreeSet<_> = segments
-            .non_appendable_then_appendable_segments()
-            .flat_map(|segment| segment.get().read().read_filtered(None, None, filter))
-            .collect();
-        Ok(all_points)
+        let segments = self.segments.clone();
+        SegmentsSearcher::read_filtered(segments, filter, runtime_handle, hw_counter).await
     }
 
     pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> LocalShardTelemetry {
@@ -824,14 +982,19 @@ impl LocalShard {
             })
             .fold(Default::default(), |acc, x| acc + x);
 
+        let total_optimized_points = self.total_optimized_points.load(Ordering::Relaxed);
+
         LocalShardTelemetry {
             variant_name: None,
+            status: None,
+            total_optimized_points,
             segments,
             optimizations: OptimizerTelemetry {
                 status: optimizer_status,
                 optimizations,
                 log: self.optimizers_log.lock().to_telemetry(),
             },
+            async_scorer: Some(get_async_scorer()),
         }
     }
 
@@ -872,15 +1035,60 @@ impl LocalShard {
         vector_size * info.points_count
     }
 
-    pub async fn local_shard_info(&self) -> CollectionInfoInternal {
+    pub async fn local_shard_status(&self) -> (ShardStatus, OptimizersStatus) {
+        {
+            let segments = self.segments().read();
+
+            // Red status on failed operation or optimizer error
+            if !segments.failed_operation.is_empty() || segments.optimizer_errors.is_some() {
+                let optimizer_status = segments
+                    .optimizer_errors
+                    .as_ref()
+                    .map_or(OptimizersStatus::Ok, |err| {
+                        OptimizersStatus::Error(err.to_string())
+                    });
+                return (ShardStatus::Red, optimizer_status);
+            }
+
+            // Yellow status if we have a special segment, indicates a proxy segment used during optimization
+            // TODO: snapshotting also creates temp proxy segments. should differentiate.
+            let has_special_segment = segments
+                .iter()
+                .map(|(_, segment)| segment.get().read().info().segment_type)
+                .any(|segment_type| segment_type == SegmentType::Special);
+            if has_special_segment {
+                return (ShardStatus::Yellow, OptimizersStatus::Ok);
+            }
+        }
+
+        // Yellow or grey status if there are pending optimizations
+        // Grey if optimizers were not triggered yet after restart,
+        // we don't automatically trigger them to prevent a crash loop
+        let (has_triggered_any_optimizers, has_suboptimal_optimizers) = self
+            .update_handler
+            .lock()
+            .await
+            .check_optimizer_conditions();
+        if has_suboptimal_optimizers {
+            let status = if has_triggered_any_optimizers {
+                ShardStatus::Yellow
+            } else {
+                ShardStatus::Grey
+            };
+            return (status, OptimizersStatus::Ok);
+        }
+
+        // Green status because everything is fine
+        (ShardStatus::Green, OptimizersStatus::Ok)
+    }
+
+    pub async fn local_shard_info(&self) -> ShardInfoInternal {
         let collection_config = self.collection_config.read().await.clone();
         let mut vectors_count = 0;
         let mut indexed_vectors_count = 0;
         let mut points_count = 0;
         let mut segments_count = 0;
-        let mut status = CollectionStatus::Green;
         let mut schema: HashMap<PayloadKeyType, PayloadIndexInfo> = Default::default();
-        let mut optimizer_status = OptimizersStatus::Ok;
 
         {
             let segments = self.segments().read();
@@ -889,9 +1097,6 @@ impl LocalShard {
 
                 let segment_info = segment.get().read().info();
 
-                if segment_info.segment_type == SegmentType::Special {
-                    status = CollectionStatus::Yellow;
-                }
                 vectors_count += segment_info.num_vectors;
                 indexed_vectors_count += segment_info.num_indexed_vectors;
                 points_count += segment_info.num_points;
@@ -902,29 +1107,11 @@ impl LocalShard {
                         .or_insert(val);
                 }
             }
-            if !segments.failed_operation.is_empty() || segments.optimizer_errors.is_some() {
-                status = CollectionStatus::Red;
-            }
-
-            if let Some(error) = &segments.optimizer_errors {
-                optimizer_status = OptimizersStatus::Error(error.to_string());
-            }
         }
 
-        // If still green while optimization conditions are triggered, mark as grey
-        if status == CollectionStatus::Green
-            && self.update_handler.lock().await.has_pending_optimizations()
-        {
-            // TODO(1.10): enable grey status in Qdrant 1.10+
-            // status = CollectionStatus::Grey;
-            if optimizer_status == OptimizersStatus::Ok {
-                optimizer_status = OptimizersStatus::Error(
-                    "optimizations pending, awaiting update operation".into(),
-                );
-            }
-        }
+        let (status, optimizer_status) = self.local_shard_status().await;
 
-        CollectionInfoInternal {
+        ShardInfoInternal {
             status,
             optimizer_status,
             vectors_count,
@@ -952,6 +1139,20 @@ impl LocalShard {
     /// This also updates the highest seen clocks.
     pub async fn update_cutoff(&self, cutoff: &RecoveryPoint) {
         self.wal.update_cutoff(cutoff).await
+    }
+
+    /// Check if the read rate limiter allows the operation to proceed
+    /// - cost: the cost of the operation
+    ///
+    /// Returns an error if the rate limit is exceeded.
+    fn check_read_rate_limiter(&self, cost: usize) -> CollectionResult<()> {
+        if let Some(rate_limiter) = &self.read_rate_limiter {
+            rate_limiter
+                .lock()
+                .try_consume(cost as f64)
+                .map_err(|err| CollectionError::rate_limit_error(err, Some(cost), false))?;
+        }
+        Ok(())
     }
 }
 
@@ -1011,19 +1212,19 @@ impl LocalShardClocks {
         Ok(())
     }
 
-    /// Copy clock data on disk from one shard path to another.
-    pub async fn copy_data(from: &Path, to: &Path) -> CollectionResult<()> {
+    /// Put clock data from the disk into an archive.
+    pub async fn archive_data(from: &Path, tar: &tar_ext::BuilderExt) -> CollectionResult<()> {
         let newest_clocks_from = Self::newest_clocks_path(from);
         let oldest_clocks_from = Self::oldest_clocks_path(from);
 
         if newest_clocks_from.exists() {
-            let newest_clocks_to = Self::newest_clocks_path(to);
-            copy(newest_clocks_from, newest_clocks_to).await?;
+            tar.append_file(&newest_clocks_from, Path::new(NEWEST_CLOCKS_PATH))
+                .await?;
         }
 
         if oldest_clocks_from.exists() {
-            let oldest_clocks_to = Self::oldest_clocks_path(to);
-            copy(oldest_clocks_from, oldest_clocks_to).await?;
+            tar.append_file(&oldest_clocks_from, Path::new(OLDEST_CLOCKS_PATH))
+                .await?;
         }
 
         Ok(())
@@ -1064,10 +1265,10 @@ impl LocalShardClocks {
     }
 
     fn newest_clocks_path(shard_path: &Path) -> PathBuf {
-        shard_path.join("newest_clocks.json")
+        shard_path.join(NEWEST_CLOCKS_PATH)
     }
 
     fn oldest_clocks_path(shard_path: &Path) -> PathBuf {
-        shard_path.join("oldest_clocks.json")
+        shard_path.join(OLDEST_CLOCKS_PATH)
     }
 }

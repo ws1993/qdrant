@@ -1,37 +1,172 @@
+use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use api::grpc::qdrant::points_internal_server::PointsInternal;
 use api::grpc::qdrant::{
     ClearPayloadPointsInternal, CoreSearchBatchPointsInternal, CountPointsInternal, CountResponse,
     CreateFieldIndexCollectionInternal, DeleteFieldIndexCollectionInternal,
-    DeletePayloadPointsInternal, DeletePointsInternal, DeleteVectorsInternal, GetPointsInternal,
-    GetResponse, PointsOperationResponseInternal, RecommendPointsInternal, RecommendResponse,
+    DeletePayloadPointsInternal, DeletePointsInternal, DeleteVectorsInternal, FacetCountsInternal,
+    FacetResponseInternal, GetPointsInternal, GetResponse, IntermediateResult,
+    PointsOperationResponseInternal, QueryBatchPointsInternal, QueryBatchResponseInternal,
+    QueryResultInternal, QueryShardPoints, RecommendPointsInternal, RecommendResponse,
     ScrollPointsInternal, ScrollResponse, SearchBatchResponse, SetPayloadPointsInternal,
     SyncPointsInternal, UpdateVectorsInternal, UpsertPointsInternal,
 };
+use collection::operations::shard_selector_internal::ShardSelectorInternal;
+use collection::operations::universal_query::shard_query::ShardQueryRequest;
+use collection::shards::shard::ShardId;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use itertools::Itertools;
+use segment::data_types::facets::{FacetParams, FacetResponse};
+use segment::json_path::JsonPath;
+use segment::types::Filter;
+use storage::content_manager::toc::request_hw_counter::RequestHwCounter;
 use storage::content_manager::toc::TableOfContent;
 use storage::rbac::Access;
 use tonic::{Request, Response, Status};
 
-use super::points_common::core_search_list;
+use super::query_common::*;
+use super::update_common::*;
 use super::validate_and_log;
-use crate::tonic::api::points_common::{
-    clear_payload, count, create_field_index_internal, delete, delete_field_index_internal,
-    delete_payload, delete_vectors, get, overwrite_payload, recommend, scroll, set_payload, sync,
-    update_vectors, upsert,
-};
+use crate::common::inference::InferenceToken;
+use crate::settings::ServiceConfig;
+use crate::tonic::verification::{StrictModeCheckedInternalTocProvider, UncheckedTocProvider};
 
 const FULL_ACCESS: Access = Access::full("Internal API");
 
 /// This API is intended for P2P communication within a distributed deployment.
 pub struct PointsInternalService {
     toc: Arc<TableOfContent>,
+    service_config: ServiceConfig,
 }
 
 impl PointsInternalService {
-    pub fn new(toc: Arc<TableOfContent>) -> Self {
-        Self { toc }
+    pub fn new(toc: Arc<TableOfContent>, service_config: ServiceConfig) -> Self {
+        Self {
+            toc,
+            service_config,
+        }
+    }
+}
+
+pub async fn query_batch_internal(
+    toc: &TableOfContent,
+    collection_name: String,
+    query_points: Vec<QueryShardPoints>,
+    shard_selection: Option<ShardId>,
+    timeout: Option<Duration>,
+    request_hw_data: RequestHwCounter,
+) -> Result<Response<QueryBatchResponseInternal>, Status> {
+    let batch_requests: Vec<_> = query_points
+        .into_iter()
+        .map(ShardQueryRequest::try_from)
+        .try_collect()?;
+
+    let timing = Instant::now();
+
+    // As this function is handling an internal request,
+    // we can assume that shard_key is already resolved
+    let shard_selection = match shard_selection {
+        None => {
+            debug_assert!(false, "Shard selection is expected for internal request");
+            ShardSelectorInternal::All
+        }
+        Some(shard_id) => ShardSelectorInternal::ShardId(shard_id),
+    };
+
+    let batch_response = toc
+        .query_batch_internal(
+            &collection_name,
+            batch_requests,
+            shard_selection,
+            timeout,
+            request_hw_data.get_counter(),
+        )
+        .await?;
+
+    let response = QueryBatchResponseInternal {
+        results: batch_response
+            .into_iter()
+            .map(|response| QueryResultInternal {
+                intermediate_results: response
+                    .into_iter()
+                    .map(|intermediate| IntermediateResult {
+                        result: intermediate.into_iter().map(From::from).collect_vec(),
+                    })
+                    .collect_vec(),
+            })
+            .collect(),
+        time: timing.elapsed().as_secs_f64(),
+        usage: request_hw_data.to_grpc_api(),
+    };
+
+    Ok(Response::new(response))
+}
+
+async fn facet_counts_internal(
+    toc: &TableOfContent,
+    request: FacetCountsInternal,
+    request_hw_data: RequestHwCounter,
+) -> Result<Response<FacetResponseInternal>, Status> {
+    let timing = Instant::now();
+
+    let FacetCountsInternal {
+        collection_name,
+        key,
+        filter,
+        limit,
+        exact,
+        shard_id,
+        timeout,
+    } = request;
+
+    let shard_selection = ShardSelectorInternal::ShardId(shard_id);
+
+    let request = FacetParams {
+        key: JsonPath::from_str(&key)
+            .map_err(|_| Status::invalid_argument("Failed to parse facet key"))?,
+        limit: limit as usize,
+        filter: filter.map(Filter::try_from).transpose()?,
+        exact,
+    };
+
+    let response = toc
+        .facet_internal(
+            &collection_name,
+            request,
+            shard_selection,
+            timeout.map(Duration::from_secs),
+            request_hw_data.get_counter(),
+        )
+        .await?;
+
+    let FacetResponse { hits } = response;
+
+    let response = FacetResponseInternal {
+        hits: hits.into_iter().map(From::from).collect_vec(),
+        time: timing.elapsed().as_secs_f64(),
+        // TODO(io_measurement): add hw data
+    };
+
+    Ok(Response::new(response))
+}
+
+impl PointsInternalService {
+    /// Generates a new `RequestHwCounter` for the request.
+    /// This counter is indented to be used for internal requests.
+    ///
+    /// So, it collects the hardware usage to the collection's counter ONLY if it was not
+    /// converted to a response.
+    fn get_request_collection_hw_usage_counter_for_internal(
+        &self,
+        collection_name: String,
+    ) -> RequestHwCounter {
+        let counter = HwMeasurementAcc::new_with_metrics_drain(
+            self.toc.get_collection_hw_metrics(collection_name),
+        );
+
+        RequestHwCounter::new(counter, self.service_config.hardware_reporting())
     }
 }
 
@@ -43,6 +178,12 @@ impl PointsInternal for PointsInternalService {
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
+        let inference_token = request
+            .extensions()
+            .get::<InferenceToken>()
+            .cloned()
+            .unwrap_or(InferenceToken(None));
+
         let UpsertPointsInternal {
             upsert_points,
             shard_id,
@@ -53,11 +194,12 @@ impl PointsInternal for PointsInternalService {
             upsert_points.ok_or_else(|| Status::invalid_argument("UpsertPoints is missing"))?;
 
         upsert(
-            self.toc.clone(),
+            StrictModeCheckedInternalTocProvider::new(&self.toc),
             upsert_points,
             clock_tag.map(Into::into),
             shard_id,
             FULL_ACCESS.clone(),
+            inference_token,
         )
         .await
     }
@@ -67,6 +209,12 @@ impl PointsInternal for PointsInternalService {
         request: Request<DeletePointsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
+
+        let inference_token = request
+            .extensions()
+            .get::<InferenceToken>()
+            .cloned()
+            .unwrap_or(InferenceToken(None));
 
         let DeletePointsInternal {
             delete_points,
@@ -78,11 +226,12 @@ impl PointsInternal for PointsInternalService {
             delete_points.ok_or_else(|| Status::invalid_argument("DeletePoints is missing"))?;
 
         delete(
-            self.toc.clone(),
+            UncheckedTocProvider::new_unchecked(&self.toc),
             delete_points,
             clock_tag.map(Into::into),
             shard_id,
             FULL_ACCESS.clone(),
+            inference_token,
         )
         .await
     }
@@ -93,6 +242,11 @@ impl PointsInternal for PointsInternalService {
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
 
+        let inference_token = request
+            .extensions()
+            .get::<InferenceToken>()
+            .cloned()
+            .unwrap_or(InferenceToken(None));
         let request = request.into_inner();
 
         let shard_id = request.shard_id;
@@ -103,11 +257,12 @@ impl PointsInternal for PointsInternalService {
             .ok_or_else(|| Status::invalid_argument("UpdateVectors is missing"))?;
 
         update_vectors(
-            self.toc.clone(),
+            StrictModeCheckedInternalTocProvider::new(&self.toc),
             update_point_vectors,
             clock_tag.map(Into::into),
             shard_id,
             FULL_ACCESS.clone(),
+            inference_token,
         )
         .await
     }
@@ -128,7 +283,7 @@ impl PointsInternal for PointsInternalService {
             .ok_or_else(|| Status::invalid_argument("DeleteVectors is missing"))?;
 
         delete_vectors(
-            self.toc.clone(),
+            UncheckedTocProvider::new_unchecked(&self.toc),
             delete_point_vectors,
             clock_tag.map(Into::into),
             shard_id,
@@ -153,7 +308,7 @@ impl PointsInternal for PointsInternalService {
             .ok_or_else(|| Status::invalid_argument("SetPayloadPoints is missing"))?;
 
         set_payload(
-            self.toc.clone(),
+            StrictModeCheckedInternalTocProvider::new(&self.toc),
             set_payload_points,
             clock_tag.map(Into::into),
             shard_id,
@@ -178,7 +333,7 @@ impl PointsInternal for PointsInternalService {
             .ok_or_else(|| Status::invalid_argument("SetPayloadPoints is missing"))?;
 
         overwrite_payload(
-            self.toc.clone(),
+            StrictModeCheckedInternalTocProvider::new(&self.toc),
             set_payload_points,
             clock_tag.map(Into::into),
             shard_id,
@@ -203,7 +358,7 @@ impl PointsInternal for PointsInternalService {
             .ok_or_else(|| Status::invalid_argument("DeletePayloadPoints is missing"))?;
 
         delete_payload(
-            self.toc.clone(),
+            UncheckedTocProvider::new_unchecked(&self.toc),
             delete_payload_points,
             clock_tag.map(Into::into),
             shard_id,
@@ -228,7 +383,7 @@ impl PointsInternal for PointsInternalService {
             .ok_or_else(|| Status::invalid_argument("ClearPayloadPoints is missing"))?;
 
         clear_payload(
-            self.toc.clone(),
+            UncheckedTocProvider::new_unchecked(&self.toc),
             clear_payload_points,
             clock_tag.map(Into::into),
             shard_id,
@@ -306,7 +461,9 @@ impl PointsInternal for PointsInternalService {
         //     .iter_mut()
         //     .for_each(|search_points| search_points.read_consistency = None);
 
-        core_search_list(
+        let hw_data =
+            self.get_request_collection_hw_usage_counter_for_internal(collection_name.clone());
+        let res = core_search_list(
             self.toc.as_ref(),
             collection_name,
             search_points,
@@ -314,8 +471,11 @@ impl PointsInternal for PointsInternalService {
             shard_id,
             FULL_ACCESS.clone(),
             timeout,
+            hw_data,
         )
-        .await
+        .await?;
+
+        Ok(res)
     }
 
     async fn recommend(
@@ -335,7 +495,18 @@ impl PointsInternal for PointsInternalService {
 
         recommend_points.read_consistency = None; // *Have* to be `None`!
 
-        recommend(self.toc.as_ref(), recommend_points, FULL_ACCESS.clone()).await
+        let collection_name = recommend_points.collection_name.clone();
+
+        let hw_data = self.get_request_collection_hw_usage_counter_for_internal(collection_name);
+        let res = recommend(
+            UncheckedTocProvider::new_unchecked(&self.toc),
+            recommend_points,
+            FULL_ACCESS.clone(),
+            hw_data,
+        )
+        .await?;
+
+        Ok(res)
     }
 
     async fn scroll(
@@ -354,11 +525,16 @@ impl PointsInternal for PointsInternalService {
 
         scroll_points.read_consistency = None; // *Have* to be `None`!
 
+        let hw_data = self.get_request_collection_hw_usage_counter_for_internal(
+            scroll_points.collection_name.clone(),
+        );
+
         scroll(
-            self.toc.as_ref(),
+            UncheckedTocProvider::new_unchecked(&self.toc),
             scroll_points,
             shard_id,
             FULL_ACCESS.clone(),
+            hw_data,
         )
         .await
     }
@@ -379,7 +555,18 @@ impl PointsInternal for PointsInternalService {
 
         get_points.read_consistency = None; // *Have* to be `None`!
 
-        get(self.toc.as_ref(), get_points, shard_id, FULL_ACCESS.clone()).await
+        let hw_data = self.get_request_collection_hw_usage_counter_for_internal(
+            get_points.collection_name.clone(),
+        );
+
+        get(
+            UncheckedTocProvider::new_unchecked(&self.toc),
+            get_points,
+            shard_id,
+            FULL_ACCESS.clone(),
+            hw_data,
+        )
+        .await
     }
 
     async fn count(
@@ -395,13 +582,18 @@ impl PointsInternal for PointsInternalService {
 
         let count_points =
             count_points.ok_or_else(|| Status::invalid_argument("CountPoints is missing"))?;
-        count(
-            self.toc.as_ref(),
+        let hw_data = self.get_request_collection_hw_usage_counter_for_internal(
+            count_points.collection_name.clone(),
+        );
+        let res = count(
+            UncheckedTocProvider::new_unchecked(&self.toc),
             count_points,
             shard_id,
-            FULL_ACCESS.clone(),
+            &FULL_ACCESS,
+            hw_data,
         )
-        .await
+        .await?;
+        Ok(res)
     }
 
     async fn sync(
@@ -409,6 +601,11 @@ impl PointsInternal for PointsInternalService {
         request: Request<SyncPointsInternal>,
     ) -> Result<Response<PointsOperationResponseInternal>, Status> {
         validate_and_log(request.get_ref());
+        let inference_token = request
+            .extensions()
+            .get::<InferenceToken>()
+            .cloned()
+            .unwrap_or(InferenceToken(None));
 
         let SyncPointsInternal {
             sync_points,
@@ -424,7 +621,50 @@ impl PointsInternal for PointsInternalService {
             clock_tag.map(Into::into),
             shard_id,
             FULL_ACCESS.clone(),
+            inference_token,
         )
         .await
+    }
+
+    async fn query_batch(
+        &self,
+        request: Request<QueryBatchPointsInternal>,
+    ) -> Result<Response<QueryBatchResponseInternal>, Status> {
+        validate_and_log(request.get_ref());
+
+        let QueryBatchPointsInternal {
+            collection_name,
+            shard_id,
+            query_points,
+            timeout,
+        } = request.into_inner();
+
+        let timeout = timeout.map(Duration::from_secs);
+
+        let hw_data =
+            self.get_request_collection_hw_usage_counter_for_internal(collection_name.clone());
+
+        query_batch_internal(
+            self.toc.as_ref(),
+            collection_name,
+            query_points,
+            shard_id,
+            timeout,
+            hw_data,
+        )
+        .await
+    }
+
+    async fn facet(
+        &self,
+        request: Request<FacetCountsInternal>,
+    ) -> Result<Response<FacetResponseInternal>, Status> {
+        validate_and_log(request.get_ref());
+
+        let request_inner = request.into_inner();
+        let hw_data = self.get_request_collection_hw_usage_counter_for_internal(
+            request_inner.collection_name.clone(),
+        );
+        facet_counts_internal(self.toc.as_ref(), request_inner, hw_data).await
     }
 }

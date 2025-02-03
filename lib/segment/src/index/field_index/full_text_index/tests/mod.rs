@@ -3,9 +3,9 @@ use rstest::rstest;
 use tempfile::Builder;
 
 use crate::common::rocksdb_wrapper::open_db_with_existing_cf;
-use crate::data_types::text_index::{TextIndexParams, TextIndexType, TokenizerType};
+use crate::data_types::index::{TextIndexParams, TextIndexType, TokenizerType};
 use crate::index::field_index::full_text_index::text_index::FullTextIndex;
-use crate::index::field_index::{PayloadFieldIndex, ValueIndexer};
+use crate::index::field_index::{FieldIndexBuilderTrait as _, PayloadFieldIndex, ValueIndexer};
 
 fn get_texts() -> Vec<String> {
     vec![
@@ -161,11 +161,13 @@ fn test_prefix_search(#[case] immutable: bool) {
         min_token_len: None,
         max_token_len: None,
         lowercase: None,
+        on_disk: None,
     };
 
     let db = open_db_with_existing_cf(&temp_dir.path().join("test_db")).unwrap();
-    let mut index = FullTextIndex::new(db.clone(), config.clone(), "text", true);
-    index.recreate().unwrap();
+    let mut index = FullTextIndex::builder(db.clone(), config.clone(), "text")
+        .make_empty()
+        .unwrap();
 
     let texts = get_texts();
 
@@ -176,7 +178,7 @@ fn test_prefix_search(#[case] immutable: bool) {
     }
 
     if immutable {
-        index = FullTextIndex::new(db, config, "text", false);
+        index = FullTextIndex::new_memory(db, config, "text", false);
         index.load().unwrap();
     }
 

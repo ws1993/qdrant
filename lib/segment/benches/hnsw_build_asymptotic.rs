@@ -9,10 +9,11 @@ use segment::data_types::vectors::VectorElementType;
 use segment::fixtures::index_fixtures::{random_vector, FakeFilterContext, TestRawScorerProducer};
 use segment::index::hnsw_index::graph_layers::GraphLayers;
 use segment::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
+use segment::index::hnsw_index::graph_links::GraphLinksFormat;
 use segment::index::hnsw_index::point_scorer::FilteredScorer;
 use segment::spaces::metric::Metric;
 use segment::spaces::simple::{CosineMetric, DotProductMetric};
+use segment::vector_storage::chunked_vector_storage::VectorOffsetType;
 
 const NUM_VECTORS: usize = 5_000;
 const DIM: usize = 16;
@@ -24,7 +25,7 @@ const USE_HEURISTIC: bool = true;
 
 fn build_index<TMetric: Metric<VectorElementType>>(
     num_vectors: usize,
-) -> (TestRawScorerProducer<TMetric>, GraphLayers<GraphLinksRam>) {
+) -> (TestRawScorerProducer<TMetric>, GraphLayers) {
     let mut rng = thread_rng();
 
     let vector_holder = TestRawScorerProducer::<TMetric>::new(DIM, num_vectors, &mut rng);
@@ -32,7 +33,7 @@ fn build_index<TMetric: Metric<VectorElementType>>(
         GraphLayersBuilder::new(num_vectors, M, M * 2, EF_CONSTRUCT, 10, USE_HEURISTIC);
     let fake_filter_context = FakeFilterContext {};
     for idx in 0..(num_vectors as PointOffsetType) {
-        let added_vector = vector_holder.vectors.get(idx).to_vec();
+        let added_vector = vector_holder.vectors.get(idx as VectorOffsetType).to_vec();
         let raw_scorer = vector_holder.get_raw_scorer(added_vector).unwrap();
         let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let level = graph_layers_builder.get_random_layer(&mut rng);
@@ -41,7 +42,7 @@ fn build_index<TMetric: Metric<VectorElementType>>(
     }
     (
         vector_holder,
-        graph_layers_builder.into_graph_layers(None).unwrap(),
+        graph_layers_builder.into_graph_layers_ram(GraphLinksFormat::Plain),
     )
 }
 

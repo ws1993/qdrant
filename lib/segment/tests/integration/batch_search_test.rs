@@ -2,24 +2,25 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::cpu::CpuPermit;
 use rand::prelude::StdRng;
 use rand::SeedableRng;
+use segment::data_types::query_context::QueryContext;
 use segment::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::index_fixtures::random_vector;
 use segment::fixtures::payload_fixtures::random_int_payload;
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
-use segment::index::hnsw_index::hnsw::HNSWIndex;
+use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::VectorIndex;
-use segment::json_path::path;
-use segment::segment_constructor::build_segment;
+use segment::json_path::JsonPath;
+use segment::payload_json;
+use segment::segment_constructor::{build_segment, VectorIndexBuildArgs};
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload, PayloadSchemaType,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, PayloadSchemaType,
     SegmentConfig, SeqNumberType, VectorDataConfig, VectorStorageType, WithPayload,
 };
-use serde_json::json;
 use tempfile::Builder;
 
 #[test]
@@ -42,7 +43,7 @@ fn test_batch_and_single_request_equivalency() {
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
-                multivec_config: None,
+                multivector_config: None,
                 datatype: None,
             },
         )]),
@@ -55,7 +56,11 @@ fn test_batch_and_single_request_equivalency() {
     let mut segment = build_segment(dir.path(), &config, true).unwrap();
 
     segment
-        .create_field_index(0, &path(int_key), Some(&PayloadSchemaType::Integer.into()))
+        .create_field_index(
+            0,
+            &JsonPath::new(int_key),
+            Some(&PayloadSchemaType::Integer.into()),
+        )
         .unwrap();
 
     for n in 0..num_vectors {
@@ -63,13 +68,20 @@ fn test_batch_and_single_request_equivalency() {
         let vector = random_vector(&mut rnd, dim);
 
         let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
-        let payload: Payload = json!({int_key:int_payload,}).into();
+        let payload = payload_json! {int_key: int_payload};
+
+        let hw_counter = HardwareCounterCell::new();
 
         segment
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
         segment
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
     }
 
@@ -80,7 +92,7 @@ fn test_batch_and_single_request_equivalency() {
         let payload_value = random_int_payload(&mut rnd, 1..=1).pop().unwrap();
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
-            path(int_key),
+            JsonPath::new(int_key),
             payload_value.into(),
         )));
 
@@ -108,6 +120,9 @@ fn test_batch_and_single_request_equivalency() {
             )
             .unwrap();
 
+        let query_context = QueryContext::default();
+        let segment_query_context = query_context.get_segment_query_context();
+
         let batch_res = segment
             .search_batch(
                 DEFAULT_VECTOR_NAME,
@@ -117,7 +132,7 @@ fn test_batch_and_single_request_equivalency() {
                 Some(&filter),
                 10,
                 None,
-                Default::default(),
+                &segment_query_context,
             )
             .unwrap();
 
@@ -149,17 +164,23 @@ fn test_batch_and_single_request_equivalency() {
 
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
-    let mut hnsw_index = HNSWIndex::<GraphLinksRam>::open(
-        hnsw_dir.path(),
-        segment.id_tracker.clone(),
-        vector_storage.clone(),
-        quantized_vectors.clone(),
-        payload_index_ptr,
-        hnsw_config,
+    let hnsw_index = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: vector_storage.clone(),
+            quantized_vectors: quantized_vectors.clone(),
+            payload_index: payload_index_ptr,
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+        },
     )
     .unwrap();
-
-    hnsw_index.build_index(permit, &stopped).unwrap();
 
     for _ in 0..10 {
         let query_vector_1 = random_vector(&mut rnd, dim).into();
@@ -168,7 +189,7 @@ fn test_batch_and_single_request_equivalency() {
         let payload_value = random_int_payload(&mut rnd, 1..=1).pop().unwrap();
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
-            path(int_key),
+            JsonPath::new(int_key),
             payload_value.into(),
         )));
 

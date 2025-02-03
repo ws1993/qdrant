@@ -6,19 +6,20 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::PointOffsetType;
 
 use crate::common::utils::{check_is_empty, check_is_null, IndexesMap};
 use crate::id_tracker::IdTrackerSS;
 use crate::index::field_index::FieldIndex;
-use crate::json_path::JsonPathInterface as _;
 use crate::payload_storage::condition_checker::ValueChecker;
 use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
-use crate::payload_storage::ConditionChecker;
+use crate::payload_storage::{ConditionChecker, PayloadStorage};
 use crate::types::{
     Condition, FieldCondition, Filter, IsEmptyCondition, IsNullCondition, MinShould,
-    OwnedPayloadRef, Payload, PayloadContainer, PayloadKeyType,
+    OwnedPayloadRef, Payload, PayloadContainer, PayloadKeyType, VectorNameBuf,
 };
+use crate::vector_storage::{VectorStorage, VectorStorageEnum};
 
 fn check_condition<F>(checker: &F, condition: &Condition) -> bool
 where
@@ -114,6 +115,7 @@ where
 pub fn check_payload<'a, R>(
     get_payload: Box<dyn Fn() -> OwnedPayloadRef<'a> + 'a>,
     id_tracker: Option<&IdTrackerSS>,
+    vector_storages: &HashMap<VectorNameBuf, Arc<AtomicRefCell<VectorStorageEnum>>>,
     query: &Filter,
     point_id: PointOffsetType,
     field_indexes: &HashMap<PayloadKeyType, R>,
@@ -129,7 +131,14 @@ where
         Condition::IsNull(is_null) => check_is_null_condition(is_null, get_payload().deref()),
         Condition::HasId(has_id) => id_tracker
             .and_then(|id_tracker| id_tracker.external_id(point_id))
-            .map_or(false, |id| has_id.has_id.contains(&id)),
+            .is_some_and(|id| has_id.has_id.contains(&id)),
+        Condition::HasVector(has_vector) => {
+            if let Some(vector_storage) = vector_storages.get(&has_vector.has_vector) {
+                !vector_storage.borrow().is_deleted_vector(point_id)
+            } else {
+                false
+            }
+        }
         Condition::Nested(nested) => {
             let nested_path = nested.array_key();
             let nested_indexes = select_nested_indexes(&nested_path, field_indexes);
@@ -140,13 +149,19 @@ where
                 .any(|object| {
                     check_payload(
                         Box::new(|| OwnedPayloadRef::from(object)),
-                        None,
+                        None,            // HasId check in nested fields is not supported
+                        &HashMap::new(), // HasVector check in nested fields is not supported
                         &nested.nested.filter,
                         point_id,
                         &nested_indexes,
                     )
                 })
         }
+
+        Condition::CustomIdChecker(cond) => id_tracker
+            .and_then(|id_tracker| id_tracker.external_id(point_id))
+            .is_some_and(|point_id| cond.check(point_id)),
+
         Condition::Filter(_) => unreachable!(),
     };
 
@@ -180,7 +195,7 @@ where
         for p in field_values {
             let mut index_checked = false;
             for index in field_indexes.as_ref() {
-                if let Some(index_check_res) = index.check_condition(field_condition, p) {
+                if let Some(index_check_res) = index.special_check_condition(field_condition, p) {
                     if index_check_res {
                         // If at least one object matches the condition, we can return true
                         return true;
@@ -211,6 +226,7 @@ where
 pub struct SimpleConditionChecker {
     payload_storage: Arc<AtomicRefCell<PayloadStorageEnum>>,
     id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+    vector_storages: HashMap<VectorNameBuf, Arc<AtomicRefCell<VectorStorageEnum>>>,
     empty_payload: Payload,
 }
 
@@ -219,10 +235,12 @@ impl SimpleConditionChecker {
     pub fn new(
         payload_storage: Arc<AtomicRefCell<PayloadStorageEnum>>,
         id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+        vector_storages: HashMap<VectorNameBuf, Arc<AtomicRefCell<VectorStorageEnum>>>,
     ) -> Self {
         SimpleConditionChecker {
             payload_storage,
             id_tracker,
+            vector_storages,
             empty_payload: Default::default(),
         }
     }
@@ -231,10 +249,14 @@ impl SimpleConditionChecker {
 #[cfg(feature = "testing")]
 impl ConditionChecker for SimpleConditionChecker {
     fn check(&self, point_id: PointOffsetType, query: &Filter) -> bool {
+        let hw_counter = HardwareCounterCell::new(); // No measurements needed as this is only for test!
+
         let payload_storage_guard = self.payload_storage.borrow();
 
         let payload_ref_cell: RefCell<Option<OwnedPayloadRef>> = RefCell::new(None);
         let id_tracker = self.id_tracker.borrow();
+
+        let vector_storages = &self.vector_storages;
 
         check_payload(
             Box::new(|| {
@@ -260,9 +282,15 @@ impl ConditionChecker for SimpleConditionChecker {
                             // The alternative:
                             // Rewrite condition checking code to support error reporting.
                             // Which may lead to slowdown and assumes a lot of changes.
-                            s.read_payload(point_id)
+                            s.read_payload(point_id, &hw_counter)
                                 .unwrap_or_else(|err| panic!("Payload storage is corrupted: {err}"))
                                 .map(|x| x.into())
+                        }
+                        PayloadStorageEnum::MmapPayloadStorage(s) => {
+                            let payload = s.get(point_id, &hw_counter).unwrap_or_else(|err| {
+                                panic!("Payload storage is corrupted: {err}")
+                            });
+                            Some(OwnedPayloadRef::from(payload))
                         }
                     };
 
@@ -272,6 +300,7 @@ impl ConditionChecker for SimpleConditionChecker {
                 payload_ref_cell.borrow().as_ref().cloned().unwrap()
             }),
             Some(id_tracker.deref()),
+            vector_storages,
             query,
             point_id,
             &IndexesMap::new(),
@@ -284,14 +313,14 @@ mod tests {
     use std::collections::HashSet;
     use std::str::FromStr;
 
-    use serde_json::json;
     use tempfile::Builder;
 
     use super::*;
     use crate::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
     use crate::id_tracker::simple_id_tracker::SimpleIdTracker;
     use crate::id_tracker::IdTracker;
-    use crate::json_path::path;
+    use crate::json_path::JsonPath;
+    use crate::payload_json;
     use crate::payload_storage::simple_payload_storage::SimplePayloadStorage;
     use crate::payload_storage::PayloadStorage;
     use crate::types::{
@@ -303,11 +332,10 @@ mod tests {
         let dir = Builder::new().prefix("db_dir").tempdir().unwrap();
         let db = open_db(dir.path(), &[DB_VECTOR_CF]).unwrap();
 
-        let payload: Payload = json!(
-            {
-                "location":{
-                    "lon": 13.404954,
-                    "lat": 52.520008,
+        let payload = payload_json! {
+            "location": {
+                "lon": 13.404954,
+                "lat": 52.520008,
             },
             "price": 499.90,
             "amount": 10,
@@ -317,9 +345,10 @@ mod tests {
             "shipped_at": "2020-02-15T00:00:00Z",
             "parts": [],
             "packaging": null,
-            "not_null": [null]
-        })
-        .into();
+            "not_null": [null],
+        };
+
+        let hw_counter = HardwareCounterCell::new();
 
         let mut payload_storage: PayloadStorageEnum =
             SimplePayloadStorage::open(db.clone()).unwrap().into();
@@ -329,80 +358,87 @@ mod tests {
         id_tracker.set_link(1.into(), 1).unwrap();
         id_tracker.set_link(2.into(), 2).unwrap();
         id_tracker.set_link(10.into(), 10).unwrap();
-        payload_storage.assign_all(0, &payload).unwrap();
+        payload_storage.overwrite(0, &payload, &hw_counter).unwrap();
 
         let payload_checker = SimpleConditionChecker::new(
             Arc::new(AtomicRefCell::new(payload_storage)),
             Arc::new(AtomicRefCell::new(id_tracker)),
+            HashMap::new(),
         );
 
         let is_empty_condition = Filter::new_must(Condition::IsEmpty(IsEmptyCondition {
-            is_empty: PayloadField { key: path("price") },
+            is_empty: PayloadField {
+                key: JsonPath::new("price"),
+            },
         }));
         assert!(!payload_checker.check(0, &is_empty_condition));
 
         let is_empty_condition = Filter::new_must(Condition::IsEmpty(IsEmptyCondition {
             is_empty: PayloadField {
-                key: path("something_new"),
+                key: JsonPath::new("something_new"),
             },
         }));
         assert!(payload_checker.check(0, &is_empty_condition));
 
         let is_empty_condition = Filter::new_must(Condition::IsEmpty(IsEmptyCondition {
-            is_empty: PayloadField { key: path("parts") },
+            is_empty: PayloadField {
+                key: JsonPath::new("parts"),
+            },
         }));
         assert!(payload_checker.check(0, &is_empty_condition));
 
         let is_empty_condition = Filter::new_must(Condition::IsEmpty(IsEmptyCondition {
             is_empty: PayloadField {
-                key: path("not_null"),
+                key: JsonPath::new("not_null"),
             },
         }));
         assert!(!payload_checker.check(0, &is_empty_condition));
 
         let is_null_condition = Filter::new_must(Condition::IsNull(IsNullCondition {
             is_null: PayloadField {
-                key: path("amount"),
-            },
-        }));
-        assert!(!payload_checker.check(0, &is_null_condition));
-
-        let is_null_condition = Filter::new_must(Condition::IsNull(IsNullCondition {
-            is_null: PayloadField { key: path("parts") },
-        }));
-        assert!(!payload_checker.check(0, &is_null_condition));
-
-        let is_null_condition = Filter::new_must(Condition::IsNull(IsNullCondition {
-            is_null: PayloadField {
-                key: path("something_else"),
+                key: JsonPath::new("amount"),
             },
         }));
         assert!(!payload_checker.check(0, &is_null_condition));
 
         let is_null_condition = Filter::new_must(Condition::IsNull(IsNullCondition {
             is_null: PayloadField {
-                key: path("packaging"),
+                key: JsonPath::new("parts"),
+            },
+        }));
+        assert!(!payload_checker.check(0, &is_null_condition));
+
+        let is_null_condition = Filter::new_must(Condition::IsNull(IsNullCondition {
+            is_null: PayloadField {
+                key: JsonPath::new("something_else"),
+            },
+        }));
+        assert!(!payload_checker.check(0, &is_null_condition));
+
+        let is_null_condition = Filter::new_must(Condition::IsNull(IsNullCondition {
+            is_null: PayloadField {
+                key: JsonPath::new("packaging"),
             },
         }));
         assert!(payload_checker.check(0, &is_null_condition));
 
         let is_null_condition = Filter::new_must(Condition::IsNull(IsNullCondition {
             is_null: PayloadField {
-                key: path("not_null"),
+                key: JsonPath::new("not_null"),
             },
         }));
         assert!(!payload_checker.check(0, &is_null_condition));
 
         let match_red = Condition::Field(FieldCondition::new_match(
-            path("color"),
+            JsonPath::new("color"),
             "red".to_owned().into(),
         ));
         let match_blue = Condition::Field(FieldCondition::new_match(
-            path("color"),
+            JsonPath::new("color"),
             "blue".to_owned().into(),
         ));
         let shipped_in_february = Condition::Field(FieldCondition::new_datetime_range(
-            path("shipped_at"),
+            JsonPath::new("shipped_at"),
             Range {
                 lt: Some(DateTimeWrapper::from_str("2020-03-01T00:00:00Z").unwrap()),
                 gt: None,
@@ -411,7 +447,7 @@ mod tests {
             },
         ));
         let shipped_in_march = Condition::Field(FieldCondition::new_datetime_range(
-            path("shipped_at"),
+            JsonPath::new("shipped_at"),
             Range {
                 lt: Some(DateTimeWrapper::from_str("2020-04-01T00:00:00Z").unwrap()),
                 gt: None,
@@ -419,12 +455,14 @@ mod tests {
                 lte: None,
             },
         ));
-        let with_delivery =
-            Condition::Field(FieldCondition::new_match(path("has_delivery"), true.into()));
+        let with_delivery = Condition::Field(FieldCondition::new_match(
+            JsonPath::new("has_delivery"),
+            true.into(),
+        ));
 
         let many_value_count_condition =
             Filter::new_must(Condition::Field(FieldCondition::new_values_count(
-                path("rating"),
+                JsonPath::new("rating"),
                 ValuesCount {
                     lt: None,
                     gt: None,
@@ -436,7 +474,7 @@ mod tests {
 
         let few_value_count_condition =
             Filter::new_must(Condition::Field(FieldCondition::new_values_count(
-                path("rating"),
+                JsonPath::new("rating"),
                 ValuesCount {
                     lt: Some(5),
                     gt: None,
@@ -447,7 +485,7 @@ mod tests {
         assert!(payload_checker.check(0, &few_value_count_condition));
 
         let in_berlin = Condition::Field(FieldCondition::new_geo_bounding_box(
-            path("location"),
+            JsonPath::new("location"),
             GeoBoundingBox {
                 top_left: GeoPoint {
                     lon: 13.08835,
@@ -461,7 +499,7 @@ mod tests {
         ));
 
         let in_moscow = Condition::Field(FieldCondition::new_geo_bounding_box(
-            path("location"),
+            JsonPath::new("location"),
             GeoBoundingBox {
                 top_left: GeoPoint {
                     lon: 37.0366,
@@ -475,7 +513,7 @@ mod tests {
         ));
 
         let with_bad_rating = Condition::Field(FieldCondition::new_range(
-            path("rating"),
+            JsonPath::new("rating"),
             Range {
                 lt: None,
                 gt: None,

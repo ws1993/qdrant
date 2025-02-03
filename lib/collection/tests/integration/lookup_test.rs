@@ -2,16 +2,20 @@ use collection::collection::Collection;
 use collection::lookup::types::PseudoId;
 use collection::lookup::{lookup_ids, WithLookup};
 use collection::operations::consistency_params::ReadConsistency;
-use collection::operations::point_ops::{Batch, WriteOrdering};
+use collection::operations::point_ops::{
+    BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal, PointOperations,
+    WriteOrdering,
+};
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::shards::shard::ShardId;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use itertools::Itertools;
 use rand::rngs::SmallRng;
 use rand::{self, Rng, SeedableRng};
 use rstest::*;
-use segment::data_types::vectors::{BatchVectorStruct, VectorStruct};
-use segment::types::{Payload, PointIdType};
-use serde_json::json;
+use segment::data_types::vectors::VectorStructInternal;
+use segment::payload_json;
+use segment::types::PointIdType;
 use tempfile::Builder;
 use tokio::sync::RwLock;
 use uuid::Uuid;
@@ -52,16 +56,17 @@ async fn setup() -> Resources {
 
     let payloads = ids
         .iter()
-        .map(|i| Some(Payload::from(json!({ "foo": format!("bar {}", i) }))))
+        .map(|i| Some(payload_json! {"foo": format!("bar {}", i)}))
         .collect_vec();
 
+    let batch = BatchPersisted {
+        ids,
+        vectors: BatchVectorStructPersisted::Single(vectors),
+        payloads: Some(payloads),
+    };
+
     let upsert_points = collection::operations::CollectionUpdateOperations::PointOperation(
-        Batch {
-            ids,
-            vectors: BatchVectorStruct::from(vectors).into(),
-            payloads: Some(payloads),
-        }
-        .into(),
+        PointOperations::UpsertPoints(PointInsertOperationsInternal::from(batch)),
     );
 
     collection
@@ -117,6 +122,8 @@ async fn happy_lookup_ids() {
         collection_by_name,
         read_consistency,
         &shard_selection,
+        None,
+        HwMeasurementAcc::new(),
     )
     .await;
 
@@ -133,17 +140,17 @@ async fn happy_lookup_ids() {
         .map(|i| (i, rng.gen::<[f32; 4]>().to_vec()))
         .filter(|(i, _)| !(&n..&1000).contains(&i))
         .map(|(_, v)| v)
-        .map(VectorStruct::from);
+        .map(VectorStructInternal::from);
 
     for (id_value, vector) in values.into_iter().zip(expected_vectors) {
         let record = result
             .get(&id_value)
-            .unwrap_or_else(|| panic!("Expected to find record for id {}", id_value));
+            .unwrap_or_else(|| panic!("Expected to find record for id {id_value}"));
 
         assert_eq!(record.id, PointIdType::try_from(id_value.clone()).unwrap());
         assert_eq!(
             record.payload,
-            Some(Payload::from(json!({ "foo": format!("bar {}", id_value) })))
+            Some(payload_json! { "foo": format!("bar {}", id_value) })
         );
         assert_eq!(record.vector, Some(vector));
     }
@@ -205,6 +212,8 @@ async fn nonexistent_lookup_ids_are_ignored(#[case] value: impl Into<PseudoId>) 
         collection_by_name,
         read_consistency,
         &shard_selection,
+        None,
+        HwMeasurementAcc::new(),
     )
     .await;
 
@@ -237,6 +246,8 @@ async fn err_when_collection_by_name_returns_none() {
         collection_by_name,
         read_consistency,
         &shard_selection,
+        None,
+        HwMeasurementAcc::new(),
     )
     .await;
 

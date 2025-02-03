@@ -7,29 +7,30 @@ pub mod operation_effect;
 pub mod payload_ops;
 pub mod point_ops;
 pub mod query_enum;
-pub mod shard_key_selector;
 pub mod shard_selector_internal;
 pub mod shared_storage_config;
 pub mod snapshot_ops;
+pub mod snapshot_storage_ops;
 pub mod types;
+pub mod universal_query;
 pub mod validation;
 pub mod vector_ops;
 pub mod vector_params_builder;
+pub mod verification;
 
 use std::collections::HashMap;
 
 use segment::json_path::JsonPath;
-use segment::types::{ExtendedPointId, PayloadFieldSchema};
+use segment::types::{ExtendedPointId, PayloadFieldSchema, PointIdType};
 use serde::{Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
-use validator::Validate;
 
-use crate::hash_ring::HashRing;
+use crate::hash_ring::{HashRingRouter, ShardIds};
 use crate::shards::shard::{PeerId, ShardId};
 
 pub type ClockToken = u64;
 
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Validate)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub struct CreateIndex {
     pub field_name: JsonPath,
@@ -144,6 +145,43 @@ pub enum CollectionUpdateOperations {
     FieldIndexOperation(FieldIndexOperations),
 }
 
+impl CollectionUpdateOperations {
+    pub fn is_upsert_points(&self) -> bool {
+        matches!(
+            self,
+            Self::PointOperation(point_ops::PointOperations::UpsertPoints(_))
+        )
+    }
+
+    pub fn is_delete_points(&self) -> bool {
+        matches!(
+            self,
+            Self::PointOperation(point_ops::PointOperations::DeletePoints { .. })
+        )
+    }
+
+    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
+        match self {
+            Self::PointOperation(op) => op.point_ids(),
+            Self::VectorOperation(op) => op.point_ids(),
+            Self::PayloadOperation(op) => op.point_ids(),
+            Self::FieldIndexOperation(_) => None,
+        }
+    }
+
+    pub fn retain_point_ids<F>(&mut self, filter: F)
+    where
+        F: Fn(&PointIdType) -> bool,
+    {
+        match self {
+            Self::PointOperation(op) => op.retain_point_ids(filter),
+            Self::VectorOperation(op) => op.retain_point_ids(filter),
+            Self::PayloadOperation(op) => op.retain_point_ids(filter),
+            Self::FieldIndexOperation(_) => (),
+        }
+    }
+}
+
 /// A mapping of operation to shard.
 /// Is a result of splitting one operation into several shards by corresponding PointIds
 pub enum OperationToShard<O> {
@@ -186,37 +224,28 @@ impl FieldIndexOperations {
     }
 }
 
-impl Validate for FieldIndexOperations {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        match self {
-            FieldIndexOperations::CreateIndex(create_index) => create_index.validate(),
-            FieldIndexOperations::DeleteIndex(_) => Ok(()),
-        }
-    }
-}
-
-impl Validate for CollectionUpdateOperations {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
-        match self {
-            CollectionUpdateOperations::PointOperation(operation) => operation.validate(),
-            CollectionUpdateOperations::VectorOperation(operation) => operation.validate(),
-            CollectionUpdateOperations::PayloadOperation(operation) => operation.validate(),
-            CollectionUpdateOperations::FieldIndexOperation(operation) => operation.validate(),
-        }
-    }
-}
-
-fn point_to_shard(point_id: ExtendedPointId, ring: &HashRing<ShardId>) -> ShardId {
-    *ring
-        .get(&point_id)
-        .expect("Hash ring is guaranteed to be non-empty")
+/// Get the shards for a point ID
+///
+/// Normally returns a single shard ID. Might return multiple if resharding is currently in
+/// progress.
+///
+/// # Panics
+///
+/// Panics if the hash ring is empty and there is no shard for the given point ID.
+fn point_to_shards(point_id: &ExtendedPointId, ring: &HashRingRouter) -> ShardIds {
+    let shard_ids = ring.get(point_id);
+    assert!(
+        !shard_ids.is_empty(),
+        "Hash ring is guaranteed to be non-empty",
+    );
+    shard_ids
 }
 
 /// Split iterator of items that have point ids by shard
-fn split_iter_by_shard<I, F, O>(
+fn split_iter_by_shard<I, F, O: Clone>(
     iter: I,
     id_extractor: F,
-    ring: &HashRing<ShardId>,
+    ring: &HashRingRouter,
 ) -> OperationToShard<Vec<O>>
 where
     I: IntoIterator<Item = O>,
@@ -224,21 +253,25 @@ where
 {
     let mut op_vec_by_shard: HashMap<ShardId, Vec<O>> = HashMap::new();
     for operation in iter {
-        let shard_id = point_to_shard(id_extractor(&operation), ring);
-        op_vec_by_shard.entry(shard_id).or_default().push(operation);
+        for shard_id in point_to_shards(&id_extractor(&operation), ring) {
+            op_vec_by_shard
+                .entry(shard_id)
+                .or_default()
+                .push(operation.clone());
+        }
     }
     OperationToShard::by_shard(op_vec_by_shard)
 }
 
 /// Trait for Operation enums to split them by shard.
 pub trait SplitByShard {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self>
+    fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self>
     where
         Self: Sized;
 }
 
 impl SplitByShard for CollectionUpdateOperations {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self> {
+    fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self> {
         match self {
             CollectionUpdateOperations::PointOperation(operation) => operation
                 .split_by_shard(ring)

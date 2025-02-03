@@ -2,11 +2,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::data_types::order_by::OrderBy;
 use segment::types::*;
 use tokio::runtime::Handle;
 
 use crate::operations::types::*;
+use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 use crate::operations::OperationWithClockTag;
 
 #[async_trait]
@@ -15,6 +18,7 @@ pub trait ShardOperation {
         &self,
         operation: OperationWithClockTag,
         wait: bool,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult>;
 
     #[allow(clippy::too_many_arguments)]
@@ -27,7 +31,9 @@ pub trait ShardOperation {
         filter: Option<&Filter>,
         search_runtime_handle: &Handle,
         order_by: Option<&OrderBy>,
-    ) -> CollectionResult<Vec<Record>>;
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>>;
 
     async fn info(&self) -> CollectionResult<CollectionInfo>;
 
@@ -36,16 +42,42 @@ pub trait ShardOperation {
         request: Arc<CoreSearchRequestBatch>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>>;
 
-    async fn count(&self, request: Arc<CountRequestInternal>) -> CollectionResult<CountResult>;
+    async fn count(
+        &self,
+        request: Arc<CountRequestInternal>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<CountResult>;
 
     async fn retrieve(
         &self,
         request: Arc<PointRequestInternal>,
         with_payload: &WithPayload,
         with_vector: &WithVector,
-    ) -> CollectionResult<Vec<Record>>;
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hardware_accumulator: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>>;
+
+    async fn query_batch(
+        &self,
+        requests: Arc<Vec<ShardQueryRequest>>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<ShardQueryResponse>>;
+
+    async fn facet(
+        &self,
+        request: Arc<FacetParams>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<FacetResponse>;
 }
 
 pub type ShardOperationSS = dyn ShardOperation + Send + Sync;

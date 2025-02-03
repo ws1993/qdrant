@@ -3,6 +3,14 @@ use std::borrow::Cow;
 use serde::Serialize;
 use validator::{Validate, ValidationError, ValidationErrors};
 
+// Multivector should be small enough to fit the chunk of vector storage
+
+#[cfg(debug_assertions)]
+pub const MAX_MULTIVECTOR_FLATTENED_LEN: usize = 32 * 1024;
+
+#[cfg(not(debug_assertions))]
+pub const MAX_MULTIVECTOR_FLATTENED_LEN: usize = 1024 * 1024;
+
 #[allow(clippy::manual_try_fold)] // `try_fold` can't be used because it shortcuts on Err
 pub fn validate_iter<T: Validate>(iter: impl Iterator<Item = T>) -> Result<(), ValidationErrors> {
     let errors = iter
@@ -41,11 +49,12 @@ where
     Err(err)
 }
 
-/// Validate that `value` is a non-empty string or `None`.
-pub fn validate_not_empty(value: &Option<String>) -> Result<(), ValidationError> {
-    match value {
-        Some(value) if value.is_empty() => Err(ValidationError::new("not_empty")),
-        _ => Ok(()),
+/// Validate that `value` is a non-empty string.
+pub fn validate_not_empty(value: &str) -> Result<(), ValidationError> {
+    if value.is_empty() {
+        Err(ValidationError::new("not_empty"))
+    } else {
+        Ok(())
     }
 }
 
@@ -90,12 +99,22 @@ where
     Ok(())
 }
 
-/// Validate that shard request has two different peers.
+/// Validate that shard request has two different peers
+///
+/// We do allow transferring from/to the same peer if the source and target shard are different.
+/// This may be used during resharding shard transfers.
 pub fn validate_shard_different_peers(
     from_peer_id: u64,
     to_peer_id: u64,
+    shard_id: u32,
+    to_shard_id: Option<u32>,
 ) -> Result<(), ValidationErrors> {
     if to_peer_id != from_peer_id {
+        return Ok(());
+    }
+
+    // If source and target shard is different, we do allow transferring from/to the same peer
+    if to_shard_id.is_some_and(|to_shard_id| to_shard_id != shard_id) {
         return Ok(());
     }
 
@@ -107,7 +126,7 @@ pub fn validate_shard_different_peers(
         error.add_param(Cow::from("other_value"), &from_peer_id.to_string());
         error.add_param(
             Cow::from("message"),
-            &format!("cannot transfer shard to itself, \"to_peer_id\" must be different than {} in \"from_peer_id\"", from_peer_id),
+            &format!("cannot transfer shard to itself, \"to_peer_id\" must be different than {from_peer_id} in \"from_peer_id\""),
         );
         error
     });
@@ -135,13 +154,6 @@ pub fn validate_sha256_hash(value: &str) -> Result<(), ValidationError> {
     Ok(())
 }
 
-pub fn validate_sha256_hash_option(value: &Option<impl AsRef<str>>) -> Result<(), ValidationError> {
-    value
-        .as_ref()
-        .map(|v| validate_sha256_hash(v.as_ref()))
-        .unwrap_or(Ok(()))
-}
-
 pub fn validate_multi_vector<T>(multivec: &[Vec<T>]) -> Result<(), ValidationErrors> {
     // non_empty
     if multivec.is_empty() {
@@ -157,6 +169,16 @@ pub fn validate_multi_vector<T>(multivec: &[Vec<T>]) -> Result<(), ValidationErr
         let mut errors = ValidationErrors::default();
         let mut err = ValidationError::new("empty_vector");
         err.add_param(Cow::from("message"), &"all vectors must be non-empty");
+        errors.add("data", err);
+        return Err(errors);
+    }
+
+    // total size of all vectors must be less than MAX_MULTIVECTOR_FLATTENED_LEN
+    let flattened_len = multivec.iter().map(|v| v.len()).sum::<usize>();
+    if flattened_len >= MAX_MULTIVECTOR_FLATTENED_LEN {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("multi_vector_too_large");
+        err.add_param(Cow::from("message"), &format!("Total size of all vectors ({flattened_len}) must be less than {MAX_MULTIVECTOR_FLATTENED_LEN}"));
         errors.add("data", err);
         return Err(errors);
     }
@@ -194,7 +216,17 @@ pub fn validate_multi_vector_len(
         errors.add("data", err);
         return Err(errors);
     }
+
     let dense_vector_len = flatten_dense_vector.len();
+    if dense_vector_len >= MAX_MULTIVECTOR_FLATTENED_LEN {
+        let mut errors = ValidationErrors::default();
+        let mut err = ValidationError::new("Vector size is too large");
+        err.add_param(Cow::from("vector_len"), &dense_vector_len);
+        err.add_param(Cow::from("vectors_count"), &vectors_count);
+        errors.add("data", err);
+        return Err(errors);
+    }
+
     if dense_vector_len % vectors_count as usize != 0 {
         let mut errors = ValidationErrors::default();
         let mut err = ValidationError::new("invalid dense vector length for vectors count");
@@ -255,10 +287,9 @@ mod tests {
 
     #[test]
     fn test_validate_not_empty() {
-        assert!(validate_not_empty(&None).is_ok());
-        assert!(validate_not_empty(&Some("not empty".into())).is_ok());
-        assert!(validate_not_empty(&Some(" ".into())).is_ok());
-        assert!(validate_not_empty(&Some("".into())).is_err());
+        assert!(validate_not_empty("not empty").is_ok());
+        assert!(validate_not_empty(" ").is_ok());
+        assert!(validate_not_empty("").is_err());
     }
 
     #[test]

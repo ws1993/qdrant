@@ -1,11 +1,13 @@
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::stream::FuturesUnordered;
 use futures::{future, StreamExt as _, TryFutureExt, TryStreamExt as _};
 use itertools::Itertools;
 use segment::data_types::order_by::{Direction, OrderBy};
 use segment::types::{ShardKey, WithPayload, WithPayloadInterface};
-use validator::Validate as _;
 
 use super::Collection;
 use crate::operations::consistency_params::ReadConsistency;
@@ -90,7 +92,7 @@ impl Collection {
         let result = tokio::task::spawn(async move {
             let _update_lock = update_lock;
 
-            let Some(shard) = shard_holder.get_shard(&shard_selection) else {
+            let Some(shard) = shard_holder.get_shard(shard_selection) else {
                 return Ok(None);
             };
 
@@ -106,7 +108,7 @@ impl Collection {
                     }
 
                     shard
-                        .update_with_consistency(operation.operation, wait, ordering)
+                        .update_with_consistency(operation.operation, wait, ordering, false)
                         .await
                         .map(Some)
                 }
@@ -135,21 +137,48 @@ impl Collection {
         ordering: WriteOrdering,
         shard_keys_selection: Option<ShardKey>,
     ) -> CollectionResult<UpdateResult> {
-        operation.validate()?;
-
         let update_lock = self.updates_lock.clone().read_owned().await;
         let shard_holder = self.shards_holder.clone().read_owned().await;
 
         let mut results = tokio::task::spawn(async move {
             let _update_lock = update_lock;
 
-            let updates: FuturesUnordered<_> = shard_holder
-                .split_by_shard(operation, &shard_keys_selection)?
-                .into_iter()
-                .map(move |(shard, operation)| {
-                    shard.update_with_consistency(operation, wait, ordering)
-                })
-                .collect();
+            let updates = FuturesUnordered::new();
+            let operations = shard_holder.split_by_shard(operation, &shard_keys_selection)?;
+
+            for (shard, operation) in operations {
+                let operation = shard_holder.split_by_mode(shard.shard_id, operation);
+
+                updates.push(async move {
+                    let mut result = UpdateResult {
+                        operation_id: None,
+                        status: UpdateStatus::Acknowledged,
+                        clock_tag: None,
+                    };
+
+                    for operation in operation.update_all {
+                        result = shard
+                            .update_with_consistency(operation, wait, ordering, false)
+                            .await?;
+                    }
+
+                    for operation in operation.update_only_existing {
+                        let res = shard
+                            .update_with_consistency(operation, wait, ordering, true)
+                            .await;
+
+                        if let Err(err) = &res {
+                            if err.is_missing_point() {
+                                continue;
+                            }
+                        }
+
+                        result = res?;
+                    }
+
+                    CollectionResult::Ok(result)
+                });
+            }
 
             let results: Vec<_> = updates.collect().await;
 
@@ -209,6 +238,8 @@ impl Collection {
         request: ScrollRequestInternal,
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<ScrollResult> {
         let default_request = ScrollRequestInternal::default();
 
@@ -224,27 +255,9 @@ impl Collection {
 
         let order_by = request.order_by.map(OrderBy::from);
 
-        // Handle case of order_by
-        if let Some(order_by) = &order_by {
-            // Validate we have a range index for the order_by key
-            let has_range_index_for_order_by_field = self
-                .payload_index_schema
-                .read()
-                .schema
-                .get(&order_by.key)
-                .is_some_and(|field| field.has_range_index());
-
-            if !has_range_index_for_order_by_field {
-                return Err(CollectionError::bad_request(format!(
-                    "No range index for `order_by` key: {}. Please create one to use `order_by`. Integer, float, and datetime payloads can have range indexes, see https://qdrant.tech/documentation/concepts/indexing/#payload-index.",
-                    &order_by.key
-                )));
-            }
-
-            // Validate user did not try to use an id offset with order_by
-            if id_offset.is_some() {
-                return Err(CollectionError::bad_input("Cannot use an `offset` when using `order_by`. The alternative for paging is to use `order_by.start_from` and a filter to exclude the IDs that you've already seen for the `order_by.start_from` value".to_string()));
-            }
+        // Validate user did not try to use an id offset with order_by
+        if order_by.is_some() && id_offset.is_some() {
+            return Err(CollectionError::bad_input("Cannot use an `offset` when using `order_by`. The alternative for paging is to use `order_by.start_from` and a filter to exclude the IDs that you've already seen for the `order_by.start_from` value".to_string()));
         };
 
         if limit == 0 {
@@ -256,7 +269,7 @@ impl Collection {
         // `order_by` does not support offset
         if order_by.is_none() {
             // Needed to return next page offset.
-            limit += 1;
+            limit = limit.saturating_add(1);
         };
 
         let local_only = shard_selection.is_shard_id();
@@ -264,6 +277,7 @@ impl Collection {
         let retrieved_points: Vec<_> = {
             let shards_holder = self.shards_holder.read().await;
             let target_shards = shards_holder.select_shards(shard_selection)?;
+
             let scroll_futures = target_shards.into_iter().map(|(shard, shard_key)| {
                 let shard_key = shard_key.cloned();
                 shard
@@ -276,6 +290,8 @@ impl Collection {
                         read_consistency,
                         local_only,
                         order_by.as_ref(),
+                        timeout,
+                        hw_measurement_acc.clone(),
                     )
                     .and_then(move |mut records| async move {
                         if shard_key.is_none() {
@@ -287,7 +303,6 @@ impl Collection {
                         Ok(records)
                     })
             });
-
             future::try_join_all(scroll_futures).await?
         };
 
@@ -297,6 +312,8 @@ impl Collection {
             None => retrieved_iter
                 .flatten()
                 .sorted_unstable_by_key(|point| point.id)
+                // Add each point only once, deduplicate point IDs
+                .dedup_by(|a, b| a.id == b.id)
                 .take(limit)
                 .map(api::rest::Record::from)
                 .collect_vec(),
@@ -304,14 +321,22 @@ impl Collection {
                 retrieved_iter
                     // Extract and remove order value from payload
                     .map(|records| {
+                        // TODO(1.11): read value only from record.order_value, remove & cleanup this part
                         records.into_iter().map(|mut record| {
                             let value;
                             if local_only {
-                                value =
-                                    order_by.get_order_value_from_payload(record.payload.as_ref());
+                                value = record.order_value.unwrap_or_else(|| {
+                                    order_by.get_order_value_from_payload(record.payload.as_ref())
+                                });
                             } else {
-                                value = order_by
-                                    .remove_order_value_from_payload(record.payload.as_mut());
+                                value = if let Some(order_value) = record.order_value {
+                                    order_by
+                                        .remove_order_value_from_payload(record.payload.as_mut());
+                                    order_value
+                                } else {
+                                    order_by
+                                        .remove_order_value_from_payload(record.payload.as_mut())
+                                };
                                 if !with_payload_interface.is_required() {
                                     // Use None instead of empty hashmap
                                     record.payload = None;
@@ -321,10 +346,14 @@ impl Collection {
                         })
                     })
                     // Get top results
-                    .kmerge_by(|(value_a, _), (value_b, _)| match order_by.direction() {
-                        Direction::Asc => value_a <= value_b,
-                        Direction::Desc => value_a >= value_b,
+                    .kmerge_by(|(value_a, record_a), (value_b, record_b)| {
+                        match order_by.direction() {
+                            Direction::Asc => (value_a, record_a.id) < (value_b, record_b.id),
+                            Direction::Desc => (value_a, record_a.id) > (value_b, record_b.id),
+                        }
                     })
+                    // Only keep the point with the most "valuable" order value
+                    .dedup_by(|(_, record_a), (_, record_b)| record_a.id == record_b.id)
                     .map(|(_, record)| api::rest::Record::from(record))
                     .take(limit)
                     .collect_vec()
@@ -349,25 +378,29 @@ impl Collection {
         request: CountRequestInternal,
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<CountResult> {
         let shards_holder = self.shards_holder.read().await;
         let shards = shards_holder.select_shards(shard_selection)?;
 
         let request = Arc::new(request);
-        let mut requests: futures::stream::FuturesUnordered<_> = shards
+
+        let mut requests: FuturesUnordered<_> = shards
             .into_iter()
             // `count` requests received through internal gRPC *always* have `shard_selection`
             .map(|(shard, _shard_key)| {
                 shard.count(
-                    request.clone(),
+                    Arc::clone(&request),
                     read_consistency,
+                    timeout,
                     shard_selection.is_shard_id(),
+                    hw_measurement_acc.clone(),
                 )
             })
             .collect();
 
         let mut count = 0;
-
         while let Some(response) = requests.try_next().await? {
             count += response.count;
         }
@@ -380,39 +413,71 @@ impl Collection {
         request: PointRequestInternal,
         read_consistency: Option<ReadConsistency>,
         shard_selection: &ShardSelectorInternal,
-    ) -> CollectionResult<Vec<Record>> {
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
         let with_payload_interface = request
             .with_payload
             .as_ref()
             .unwrap_or(&WithPayloadInterface::Bool(false));
         let with_payload = WithPayload::from(with_payload_interface);
+        let ids_len = request.ids.len();
         let request = Arc::new(request);
-        let all_shard_collection_results = {
-            let shard_holder = self.shards_holder.read().await;
-            let target_shards = shard_holder.select_shards(shard_selection)?;
-            let retrieve_futures = target_shards.into_iter().map(|(shard, shard_key)| {
-                let shard_key = shard_key.cloned();
-                shard
-                    .retrieve(
-                        request.clone(),
-                        &with_payload,
-                        &request.with_vector,
-                        read_consistency,
-                        shard_selection.is_shard_id(),
-                    )
-                    .and_then(move |mut records| async move {
-                        if shard_key.is_none() {
-                            return Ok(records);
-                        }
-                        for point in &mut records {
-                            point.shard_key.clone_from(&shard_key);
-                        }
-                        Ok(records)
-                    })
-            });
-            future::try_join_all(retrieve_futures).await?
-        };
-        let points = all_shard_collection_results.into_iter().flatten().collect();
+
+        let shard_holder = self.shards_holder.read().await;
+        let target_shards = shard_holder.select_shards(shard_selection)?;
+        let mut all_shard_collection_requests = target_shards
+            .into_iter()
+            .map(|(shard, shard_key)| {
+                // Explicitly borrow `request` and `with_payload`, so we can use them in `async move`
+                // block below without unnecessarily cloning anything
+                let request = &request;
+                let with_payload = &with_payload;
+
+                let hw_acc = hw_measurement_acc.clone();
+
+                async move {
+                    let mut records = shard
+                        .retrieve(
+                            request.clone(),
+                            with_payload,
+                            &request.with_vector,
+                            read_consistency,
+                            timeout,
+                            shard_selection.is_shard_id(),
+                            hw_acc,
+                        )
+                        .await?;
+
+                    if shard_key.is_none() {
+                        return Ok(records);
+                    }
+
+                    for point in &mut records {
+                        point.shard_key.clone_from(&shard_key.cloned());
+                    }
+
+                    CollectionResult::Ok(records)
+                }
+            })
+            .collect::<FuturesUnordered<_>>();
+
+        // pre-allocate hashmap with capped capacity to protect from malevolent input
+        let mut covered_point_ids = HashMap::with_capacity(ids_len.min(1024));
+        while let Some(response) = all_shard_collection_requests.try_next().await? {
+            for point in response {
+                // Add each point only once, deduplicate point IDs
+                covered_point_ids.insert(point.id, point);
+            }
+        }
+
+        // Collect points in the same order as they were requested
+        let points = request
+            .ids
+            .iter()
+            .filter_map(|id| covered_point_ids.remove(id))
+            .collect();
+
         Ok(points)
     }
 }

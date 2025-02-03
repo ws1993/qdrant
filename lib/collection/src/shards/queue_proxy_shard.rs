@@ -4,11 +4,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
+use common::tar_ext;
 use common::types::TelemetryDetail;
 use parking_lot::Mutex as ParkingMutex;
+use segment::data_types::facets::{FacetParams, FacetResponse};
 use segment::data_types::order_by::OrderBy;
+use segment::index::field_index::CardinalityEstimation;
 use segment::types::{
-    ExtendedPointId, Filter, ScoredPoint, WithPayload, WithPayloadInterface, WithVector,
+    ExtendedPointId, Filter, ScoredPoint, SnapshotFormat, WithPayload, WithPayloadInterface,
+    WithVector,
 };
 use tokio::runtime::Handle;
 use tokio::sync::Mutex;
@@ -20,8 +25,9 @@ use super::update_tracker::UpdateTracker;
 use crate::operations::point_ops::WriteOrdering;
 use crate::operations::types::{
     CollectionError, CollectionInfo, CollectionResult, CoreSearchRequestBatch,
-    CountRequestInternal, CountResult, PointRequestInternal, Record, UpdateResult,
+    CountRequestInternal, CountResult, PointRequestInternal, RecordInternal, UpdateResult,
 };
+use crate::operations::universal_query::shard_query::{ShardQueryRequest, ShardQueryResponse};
 use crate::operations::OperationWithClockTag;
 use crate::shards::local_shard::LocalShard;
 use crate::shards::shard_trait::ShardOperation;
@@ -96,9 +102,10 @@ impl QueueProxyShard {
         let wal = wrapped_shard.wal.wal.clone();
         let wal_lock = wal.lock();
 
-        // If start version is not in current WAL bounds [first_idx, last_idx], we cannot reliably transfer WAL
+        // If start version is not in current WAL bounds [first_idx, last_idx + 1], we cannot reliably transfer WAL
+        // Allow it to be one higher than the last index to only send new updates
         let (first_idx, last_idx) = (wal_lock.first_closed_index(), wal_lock.last_index());
-        if !(first_idx..=last_idx).contains(&version) {
+        if !(first_idx..=last_idx + 1).contains(&version) {
             return Err((wrapped_shard, CollectionError::service_error(format!("Cannot create queue proxy shard from version {version} because it is out of WAL bounds ({first_idx}..={last_idx})"))));
         }
 
@@ -113,17 +120,25 @@ impl QueueProxyShard {
         })
     }
 
+    /// Get inner queue proxy shard. Will panic if the queue proxy has been finalized.
+    fn inner_unchecked(&self) -> &Inner {
+        self.inner.as_ref().expect("Queue proxy has been finalized")
+    }
+
+    fn inner_mut_unchecked(&mut self) -> &mut Inner {
+        self.inner.as_mut().expect("Queue proxy has been finalized")
+    }
+
     pub async fn create_snapshot(
         &self,
         temp_path: &Path,
-        target_path: &Path,
+        tar: &tar_ext::BuilderExt,
+        format: SnapshotFormat,
         save_wal: bool,
     ) -> CollectionResult<()> {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
+        self.inner_unchecked()
             .wrapped_shard
-            .create_snapshot(temp_path, target_path, save_wal)
+            .create_snapshot(temp_path, tar, format, save_wal)
             .await
     }
 
@@ -139,36 +154,35 @@ impl QueueProxyShard {
     /// likely won't be updated. In the worst case this might cause double sending operations.
     /// This should be fine as operations are idempotent.
     pub async fn transfer_all_missed_updates(&self) -> CollectionResult<()> {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
-            .transfer_all_missed_updates()
-            .await
+        self.inner_unchecked().transfer_all_missed_updates().await
     }
 
     pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
+        self.inner_unchecked()
             .wrapped_shard
             .on_optimizer_config_update()
             .await
     }
 
+    pub async fn on_strict_mode_config_update(&mut self) {
+        self.inner_mut_unchecked()
+            .wrapped_shard
+            .on_strict_mode_config_update()
+            .await
+    }
+
+    pub fn trigger_optimizers(&self) {
+        self.inner_unchecked().wrapped_shard.trigger_optimizers();
+    }
+
     pub fn get_telemetry_data(&self, detail: TelemetryDetail) -> LocalShardTelemetry {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
+        self.inner_unchecked()
             .wrapped_shard
             .get_telemetry_data(detail)
     }
 
     pub fn update_tracker(&self) -> &UpdateTracker {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
-            .wrapped_shard
-            .update_tracker()
+        self.inner_unchecked().wrapped_shard.update_tracker()
     }
 
     /// Check if the queue proxy shard is already finalized
@@ -199,6 +213,15 @@ impl QueueProxyShard {
 
         (queue_proxy.wrapped_shard, queue_proxy.remote_shard)
     }
+
+    pub fn estimate_cardinality(
+        &self,
+        filter: Option<&Filter>,
+    ) -> CollectionResult<CardinalityEstimation> {
+        self.inner_unchecked()
+            .wrapped_shard
+            .estimate_cardinality(filter)
+    }
 }
 
 #[async_trait]
@@ -212,12 +235,11 @@ impl ShardOperation for QueueProxyShard {
         &self,
         operation: OperationWithClockTag,
         wait: bool,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // `Inner::update` is cancel safe, so this is also cancel safe.
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
-            .update(operation, wait)
+        self.inner_unchecked()
+            .update(operation, wait, hw_measurement_acc)
             .await
     }
 
@@ -231,10 +253,10 @@ impl ShardOperation for QueueProxyShard {
         filter: Option<&Filter>,
         search_runtime_handle: &Handle,
         order_by: Option<&OrderBy>,
-    ) -> CollectionResult<Vec<Record>> {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
+        self.inner_unchecked()
             .scroll_by(
                 offset,
                 limit,
@@ -243,37 +265,38 @@ impl ShardOperation for QueueProxyShard {
                 filter,
                 search_runtime_handle,
                 order_by,
+                timeout,
+                hw_measurement_acc,
             )
             .await
     }
 
     /// Forward read-only `info` to `wrapped_shard`
     async fn info(&self) -> CollectionResult<CollectionInfo> {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
-            .info()
-            .await
+        self.inner_unchecked().info().await
     }
     async fn core_search(
         &self,
         request: Arc<CoreSearchRequestBatch>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
-            .core_search(request, search_runtime_handle, timeout)
+        self.inner_unchecked()
+            .core_search(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 
     /// Forward read-only `count` to `wrapped_shard`
-    async fn count(&self, request: Arc<CountRequestInternal>) -> CollectionResult<CountResult> {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
-            .count(request)
+    async fn count(
+        &self,
+        request: Arc<CountRequestInternal>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<CountResult> {
+        self.inner_unchecked()
+            .count(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 
@@ -283,11 +306,46 @@ impl ShardOperation for QueueProxyShard {
         request: Arc<PointRequestInternal>,
         with_payload: &WithPayload,
         with_vector: &WithVector,
-    ) -> CollectionResult<Vec<Record>> {
-        self.inner
-            .as_ref()
-            .expect("Queue proxy has been finalized")
-            .retrieve(request, with_payload, with_vector)
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
+        self.inner_unchecked()
+            .retrieve(
+                request,
+                with_payload,
+                with_vector,
+                search_runtime_handle,
+                timeout,
+                hw_measurement_acc,
+            )
+            .await
+    }
+
+    /// Forward read-only `query` to `wrapped_shard`
+    async fn query_batch(
+        &self,
+        requests: Arc<Vec<ShardQueryRequest>>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<ShardQueryResponse>> {
+        self.inner_unchecked()
+            .wrapped_shard
+            .query_batch(requests, search_runtime_handle, timeout, hw_measurement_acc)
+            .await
+    }
+
+    async fn facet(
+        &self,
+        request: Arc<FacetParams>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<FacetResponse> {
+        self.inner_unchecked()
+            .wrapped_shard
+            .facet(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 }
@@ -409,6 +467,10 @@ impl Inner {
             let items_left = (wal.last_index() + 1).saturating_sub(transfer_from);
             let items_total = (transfer_from - self.started_at) + items_left;
             let batch = wal.read(transfer_from).take(BATCH_SIZE).collect::<Vec<_>>();
+            debug_assert!(
+                batch.len() <= items_left as usize,
+                "batch cannot be larger than items_left",
+            );
             (items_left, items_total, batch)
         };
 
@@ -489,6 +551,7 @@ impl ShardOperation for Inner {
         &self,
         operation: OperationWithClockTag,
         wait: bool,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<UpdateResult> {
         // `LocalShard::update` is cancel safe, so this is also cancel safe.
 
@@ -497,7 +560,9 @@ impl ShardOperation for Inner {
         let local_shard = &self.wrapped_shard;
         // Shard update is within a write lock scope, because we need a way to block the shard updates
         // during the transfer restart and finalization.
-        local_shard.update(operation.clone(), wait).await
+        local_shard
+            .update(operation.clone(), wait, hw_measurement_acc)
+            .await
     }
 
     /// Forward read-only `scroll_by` to `wrapped_shard`
@@ -510,7 +575,9 @@ impl ShardOperation for Inner {
         filter: Option<&Filter>,
         search_runtime_handle: &Handle,
         order_by: Option<&OrderBy>,
-    ) -> CollectionResult<Vec<Record>> {
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
         let local_shard = &self.wrapped_shard;
         local_shard
             .scroll_by(
@@ -521,6 +588,8 @@ impl ShardOperation for Inner {
                 filter,
                 search_runtime_handle,
                 order_by,
+                timeout,
+                hw_measurement_acc,
             )
             .await
     }
@@ -537,17 +606,26 @@ impl ShardOperation for Inner {
         request: Arc<CoreSearchRequestBatch>,
         search_runtime_handle: &Handle,
         timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         let local_shard = &self.wrapped_shard;
         local_shard
-            .core_search(request, search_runtime_handle, timeout)
+            .core_search(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 
     /// Forward read-only `count` to `wrapped_shard`
-    async fn count(&self, request: Arc<CountRequestInternal>) -> CollectionResult<CountResult> {
+    async fn count(
+        &self,
+        request: Arc<CountRequestInternal>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<CountResult> {
         let local_shard = &self.wrapped_shard;
-        local_shard.count(request).await
+        local_shard
+            .count(request, search_runtime_handle, timeout, hw_measurement_acc)
+            .await
     }
 
     /// Forward read-only `retrieve` to `wrapped_shard`
@@ -556,10 +634,47 @@ impl ShardOperation for Inner {
         request: Arc<PointRequestInternal>,
         with_payload: &WithPayload,
         with_vector: &WithVector,
-    ) -> CollectionResult<Vec<Record>> {
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<RecordInternal>> {
         let local_shard = &self.wrapped_shard;
         local_shard
-            .retrieve(request, with_payload, with_vector)
+            .retrieve(
+                request,
+                with_payload,
+                with_vector,
+                search_runtime_handle,
+                timeout,
+                hw_measurement_acc,
+            )
+            .await
+    }
+
+    /// Forward read-only `query` to `wrapped_shard`
+    async fn query_batch(
+        &self,
+        request: Arc<Vec<ShardQueryRequest>>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<Vec<ShardQueryResponse>> {
+        let local_shard = &self.wrapped_shard;
+        local_shard
+            .query_batch(request, search_runtime_handle, timeout, hw_measurement_acc)
+            .await
+    }
+
+    async fn facet(
+        &self,
+        request: Arc<FacetParams>,
+        search_runtime_handle: &Handle,
+        timeout: Option<Duration>,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> CollectionResult<FacetResponse> {
+        let local_shard = &self.wrapped_shard;
+        local_shard
+            .facet(request, search_runtime_handle, timeout, hw_measurement_acc)
             .await
     }
 }

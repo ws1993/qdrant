@@ -23,13 +23,16 @@ where
         return vec![];
     }
 
-    // If small values is better - PQ should pop-out big values first.
-    // Hence is should be min-heap
+    // If the caller is interested in smallest
+    // values coming first, the priority queue should be a min-heap
     let mut pq = FixedLengthPriorityQueue::new(top);
     for element in elements {
         pq.push(Reverse(element));
     }
-    pq.into_vec().into_iter().map(|Reverse(x)| x).collect()
+    pq.into_sorted_vec()
+        .into_iter()
+        .map(|Reverse(x)| x)
+        .collect()
 }
 
 pub fn peek_top_largest_iterable<I, E: Ord>(elements: I, top: usize) -> Vec<E>
@@ -40,13 +43,13 @@ where
         return vec![];
     }
 
-    // If big values is better - PQ should pop-out small values first.
-    // Hence it should be min-heap
+    // If the caller is interested in greatest
+    // values coming first, the priority queue should be a max-heap
     let mut pq = FixedLengthPriorityQueue::new(top);
     for element in elements {
         pq.push(element);
     }
-    pq.into_vec()
+    pq.into_sorted_vec()
 }
 
 pub fn peek_top_scores<E: Ord + Clone>(scores: &[E], top: usize) -> Vec<E> {

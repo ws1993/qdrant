@@ -1,11 +1,14 @@
-use segment::data_types::vectors::{DenseVector, Named, NamedQuery, NamedVectorStruct, Vector};
-use segment::vector_storage::query::context_query::ContextQuery;
-use segment::vector_storage::query::discovery_query::DiscoveryQuery;
-use segment::vector_storage::query::reco_query::RecoQuery;
+use std::fmt::Debug;
+
+use segment::data_types::vectors::{
+    DenseVector, Named, NamedQuery, NamedVectorStruct, VectorInternal,
+};
+use segment::types::VectorName;
+use segment::vector_storage::query::{ContextQuery, DiscoveryQuery, RecoQuery};
 use sparse::common::sparse_vector::SparseVector;
 
 impl QueryEnum {
-    pub fn get_vector_name(&self) -> &str {
+    pub fn get_vector_name(&self) -> &VectorName {
         match self {
             QueryEnum::Nearest(vector) => vector.get_name(),
             QueryEnum::RecommendBestScore(reco_query) => reco_query.get_name(),
@@ -14,7 +17,17 @@ impl QueryEnum {
         }
     }
 
-    pub fn iterate_sparse(&self, mut f: impl FnMut(&str, &SparseVector)) {
+    /// Only when the distance is the scoring, this will return true.
+    pub fn is_distance_scored(&self) -> bool {
+        match self {
+            QueryEnum::Nearest(_) => true,
+            QueryEnum::RecommendBestScore(_) | QueryEnum::Discover(_) | QueryEnum::Context(_) => {
+                false
+            }
+        }
+    }
+
+    pub fn iterate_sparse(&self, mut f: impl FnMut(&VectorName, &SparseVector)) {
         match self {
             QueryEnum::Nearest(vector) => match vector {
                 NamedVectorStruct::Sparse(named_sparse_vector) => {
@@ -28,8 +41,8 @@ impl QueryEnum {
                 let name = reco_query.get_name();
                 for vector in reco_query.query.flat_iter() {
                     match vector {
-                        Vector::Sparse(sparse_vector) => f(name, sparse_vector),
-                        Vector::Dense(_) | Vector::MultiDense(_) => {}
+                        VectorInternal::Sparse(sparse_vector) => f(name, sparse_vector),
+                        VectorInternal::Dense(_) | VectorInternal::MultiDense(_) => {}
                     }
                 }
             }
@@ -37,8 +50,8 @@ impl QueryEnum {
                 let name = discovery_query.get_name();
                 for pair in discovery_query.query.flat_iter() {
                     match pair {
-                        Vector::Sparse(sparse_vector) => f(name, sparse_vector),
-                        Vector::Dense(_) | Vector::MultiDense(_) => {}
+                        VectorInternal::Sparse(sparse_vector) => f(name, sparse_vector),
+                        VectorInternal::Dense(_) | VectorInternal::MultiDense(_) => {}
                     }
                 }
             }
@@ -46,8 +59,8 @@ impl QueryEnum {
                 let name = context_query.get_name();
                 for pair in context_query.query.flat_iter() {
                     match pair {
-                        Vector::Sparse(sparse_vector) => f(name, sparse_vector),
-                        Vector::Dense(_) | Vector::MultiDense(_) => {}
+                        VectorInternal::Sparse(sparse_vector) => f(name, sparse_vector),
+                        VectorInternal::Dense(_) | VectorInternal::MultiDense(_) => {}
                     }
                 }
             }
@@ -58,9 +71,9 @@ impl QueryEnum {
 #[derive(Debug, Clone, PartialEq)]
 pub enum QueryEnum {
     Nearest(NamedVectorStruct),
-    RecommendBestScore(NamedQuery<RecoQuery<Vector>>),
-    Discover(NamedQuery<DiscoveryQuery<Vector>>),
-    Context(NamedQuery<ContextQuery<Vector>>),
+    RecommendBestScore(NamedQuery<RecoQuery<VectorInternal>>),
+    Discover(NamedQuery<DiscoveryQuery<VectorInternal>>),
+    Context(NamedQuery<ContextQuery<VectorInternal>>),
 }
 
 impl From<DenseVector> for QueryEnum {
@@ -69,8 +82,8 @@ impl From<DenseVector> for QueryEnum {
     }
 }
 
-impl From<NamedQuery<DiscoveryQuery<Vector>>> for QueryEnum {
-    fn from(query: NamedQuery<DiscoveryQuery<Vector>>) -> Self {
+impl From<NamedQuery<DiscoveryQuery<VectorInternal>>> for QueryEnum {
+    fn from(query: NamedQuery<DiscoveryQuery<VectorInternal>>) -> Self {
         QueryEnum::Discover(query)
     }
 }

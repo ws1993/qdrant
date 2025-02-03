@@ -1,5 +1,9 @@
+use collection::operations::config_diff::{
+    CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
+};
 use collection::operations::conversions::sharding_method_from_proto;
-use collection::operations::types::SparseVectorsConfig;
+use collection::operations::types::{SparseVectorsConfig, VectorsConfigDiff};
+use segment::types::{StrictModeConfig, StrictModeMultivectorConfig, StrictModeSparseConfig};
 use tonic::Status;
 
 use crate::content_manager::collection_meta_ops::{
@@ -10,27 +14,31 @@ use crate::content_manager::collection_meta_ops::{
 };
 use crate::content_manager::errors::StorageError;
 
-pub fn error_to_status(error: StorageError) -> tonic::Status {
-    let error_code = match &error {
-        StorageError::BadInput { .. } => tonic::Code::InvalidArgument,
-        StorageError::NotFound { .. } => tonic::Code::NotFound,
-        StorageError::ServiceError { .. } => tonic::Code::Internal,
-        StorageError::BadRequest { .. } => tonic::Code::InvalidArgument,
-        StorageError::Locked { .. } => tonic::Code::FailedPrecondition,
-        StorageError::Timeout { .. } => tonic::Code::DeadlineExceeded,
-        StorageError::AlreadyExists { .. } => tonic::Code::AlreadyExists,
-        StorageError::ChecksumMismatch { .. } => tonic::Code::DataLoss,
-        StorageError::Forbidden { .. } => tonic::Code::PermissionDenied,
-        StorageError::PreconditionFailed { .. } => tonic::Code::FailedPrecondition,
-    };
-    tonic::Status::new(error_code, format!("{error}"))
+impl From<StorageError> for tonic::Status {
+    fn from(error: StorageError) -> Self {
+        let error_code = match &error {
+            StorageError::BadInput { .. } => tonic::Code::InvalidArgument,
+            StorageError::NotFound { .. } => tonic::Code::NotFound,
+            StorageError::ServiceError { .. } => tonic::Code::Internal,
+            StorageError::BadRequest { .. } => tonic::Code::InvalidArgument,
+            StorageError::Locked { .. } => tonic::Code::FailedPrecondition,
+            StorageError::Timeout { .. } => tonic::Code::DeadlineExceeded,
+            StorageError::AlreadyExists { .. } => tonic::Code::AlreadyExists,
+            StorageError::ChecksumMismatch { .. } => tonic::Code::DataLoss,
+            StorageError::Forbidden { .. } => tonic::Code::PermissionDenied,
+            StorageError::PreconditionFailed { .. } => tonic::Code::FailedPrecondition,
+            StorageError::InferenceError { .. } => tonic::Code::InvalidArgument,
+            StorageError::RateLimitExceeded { .. } => tonic::Code::ResourceExhausted,
+        };
+        Status::new(error_code, format!("{error}"))
+    }
 }
 
 impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
     type Error = Status;
 
     fn try_from(value: api::grpc::qdrant::CreateCollection) -> Result<Self, Self::Error> {
-        Ok(Self::CreateCollection(CreateCollectionOperation::new(
+        let op = CreateCollectionOperation::new(
             value.collection_name,
             CreateCollection {
                 vectors: match value.vectors_config.and_then(|config| config.config) {
@@ -40,10 +48,11 @@ impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
                 },
                 sparse_vectors: value
                     .sparse_vectors_config
-                    .map(|config| config.map.into_iter().map(|(k, v)| (k, v.into())).collect()),
+                    .map(|v| SparseVectorsConfig::try_from(v).map(|SparseVectorsConfig(x)| x))
+                    .transpose()?,
                 hnsw_config: value.hnsw_config.map(|v| v.into()),
                 wal_config: value.wal_config.map(|v| v.into()),
-                optimizers_config: value.optimizers_config.map(|v| v.into()),
+                optimizers_config: value.optimizers_config.map(TryFrom::try_from).transpose()?,
                 shard_number: value.shard_number,
                 on_disk_payload: value.on_disk_payload,
                 replication_factor: value.replication_factor,
@@ -59,8 +68,39 @@ impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
                     .sharding_method
                     .map(sharding_method_from_proto)
                     .transpose()?,
+                strict_mode_config: value.strict_mode_config.map(strict_mode_from_api),
+                uuid: None,
             },
-        )))
+        )?;
+        Ok(CollectionMetaOperations::CreateCollection(op))
+    }
+}
+
+pub fn strict_mode_from_api(value: api::grpc::qdrant::StrictModeConfig) -> StrictModeConfig {
+    StrictModeConfig {
+        enabled: value.enabled,
+        max_query_limit: value.max_query_limit.map(|i| i as usize),
+        max_timeout: value.max_timeout.map(|i| i as usize),
+        unindexed_filtering_retrieve: value.unindexed_filtering_retrieve,
+        unindexed_filtering_update: value.unindexed_filtering_update,
+        search_max_hnsw_ef: value.search_max_hnsw_ef.map(|i| i as usize),
+        search_allow_exact: value.search_allow_exact,
+        search_max_oversampling: value.search_max_oversampling.map(f64::from),
+        upsert_max_batchsize: value.upsert_max_batchsize.map(|i| i as usize),
+        max_collection_vector_size_bytes: value
+            .max_collection_vector_size_bytes
+            .map(|i| i as usize),
+        read_rate_limit: value.write_rate_limit.map(|i| i as usize),
+        write_rate_limit: value.write_rate_limit.map(|i| i as usize),
+        max_collection_payload_size_bytes: value
+            .max_collection_payload_size_bytes
+            .map(|i| i as usize),
+        filter_max_conditions: value.filter_max_conditions.map(|i| i as usize),
+        condition_max_size: value.condition_max_size.map(|i| i as usize),
+        multivector_config: value
+            .multivector_config
+            .map(StrictModeMultivectorConfig::from),
+        sparse_config: value.sparse_config.map(StrictModeSparseConfig::from),
     }
 }
 
@@ -74,20 +114,26 @@ impl TryFrom<api::grpc::qdrant::UpdateCollection> for CollectionMetaOperations {
                 vectors: value
                     .vectors_config
                     .and_then(|config| config.config)
-                    .map(TryInto::try_into)
+                    .map(VectorsConfigDiff::try_from)
                     .transpose()?,
-                hnsw_config: value.hnsw_config.map(Into::into),
-                params: value.params.map(TryInto::try_into).transpose()?,
-                optimizers_config: value.optimizers_config.map(Into::into),
+                hnsw_config: value.hnsw_config.map(HnswConfigDiff::from),
+                params: value
+                    .params
+                    .map(CollectionParamsDiff::try_from)
+                    .transpose()?,
+                optimizers_config: value
+                    .optimizers_config
+                    .map(OptimizersConfigDiff::try_from)
+                    .transpose()?,
                 quantization_config: value
                     .quantization_config
-                    .map(TryInto::try_into)
+                    .map(QuantizationConfigDiff::try_from)
                     .transpose()?,
-                sparse_vectors: value.sparse_vectors_config.map(|config| {
-                    SparseVectorsConfig(
-                        config.map.into_iter().map(|(k, v)| (k, v.into())).collect(),
-                    )
-                }),
+                sparse_vectors: value
+                    .sparse_vectors_config
+                    .map(SparseVectorsConfig::try_from)
+                    .transpose()?,
+                strict_mode_config: value.strict_mode_config.map(StrictModeConfig::from),
             },
         )))
     }

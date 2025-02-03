@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use schemars::JsonSchema;
+use segment::index::hnsw_index::num_rayon_threads;
 use segment::types::{HnswConfig, QuantizationConfig};
 use serde::{Deserialize, Serialize};
 use validator::Validate;
@@ -46,9 +47,10 @@ pub struct OptimizersConfig {
     /// If not set, will be automatically selected considering the number of available CPUs.
     #[serde(alias = "max_segment_size_kb")]
     #[serde(default)]
+    #[validate(range(min = 1))]
     pub max_segment_size: Option<usize>,
     /// Maximum size (in kilobytes) of vectors to store in-memory per segment.
-    /// Segments larger than this threshold will be stored as read-only memmaped file.
+    /// Segments larger than this threshold will be stored as read-only memmapped file.
     ///
     /// Memmap storage is disabled by default, to enable it, set this threshold to a reasonable value.
     ///
@@ -104,12 +106,30 @@ impl OptimizersConfig {
         }
     }
 
-    pub fn get_max_segment_size(&self) -> usize {
+    pub fn optimizer_thresholds(&self, num_indexing_threads: usize) -> OptimizerThresholds {
+        let indexing_threshold_kb = match self.indexing_threshold {
+            None => DEFAULT_INDEXING_THRESHOLD_KB, // default value
+            Some(0) => usize::MAX,                 // disable vector index
+            Some(custom) => custom,
+        };
+
+        let memmap_threshold_kb = match self.memmap_threshold {
+            None | Some(0) => usize::MAX, // default | disable memmap
+            Some(custom) => custom,
+        };
+
+        OptimizerThresholds {
+            memmap_threshold_kb,
+            indexing_threshold_kb,
+            max_segment_size_kb: self.get_max_segment_size_in_kilobytes(num_indexing_threads),
+        }
+    }
+
+    pub fn get_max_segment_size_in_kilobytes(&self, num_indexing_threads: usize) -> usize {
         if let Some(max_segment_size) = self.max_segment_size {
             max_segment_size
         } else {
-            let num_cpus = common::cpu::get_num_cpus();
-            num_cpus.saturating_mul(DEFAULT_MAX_SEGMENT_PER_CPU_KB)
+            num_indexing_threads.saturating_mul(DEFAULT_MAX_SEGMENT_PER_CPU_KB)
         }
     }
 }
@@ -135,30 +155,15 @@ pub fn build_optimizers(
     hnsw_config: &HnswConfig,
     quantization_config: &Option<QuantizationConfig>,
 ) -> Arc<Vec<Arc<Optimizer>>> {
+    let num_indexing_threads = num_rayon_threads(hnsw_config.max_indexing_threads);
     let segments_path = shard_path.join(SEGMENTS_PATH);
     let temp_segments_path = shard_path.join(TEMP_SEGMENTS_PATH);
-
-    let indexing_threshold = match optimizers_config.indexing_threshold {
-        None => DEFAULT_INDEXING_THRESHOLD_KB, // default value
-        Some(0) => usize::MAX,                 // disable vector index
-        Some(custom) => custom,
-    };
-
-    let memmap_threshold = match optimizers_config.memmap_threshold {
-        None | Some(0) => usize::MAX, // default | disable memmap
-        Some(custom) => custom,
-    };
-
-    let threshold_config = OptimizerThresholds {
-        memmap_threshold,
-        indexing_threshold,
-        max_segment_size: optimizers_config.get_max_segment_size(),
-    };
+    let threshold_config = optimizers_config.optimizer_thresholds(num_indexing_threads);
 
     Arc::new(vec![
         Arc::new(MergeOptimizer::new(
             optimizers_config.get_number_segments(),
-            threshold_config.clone(),
+            threshold_config,
             segments_path.clone(),
             temp_segments_path.clone(),
             collection_params.clone(),
@@ -167,7 +172,7 @@ pub fn build_optimizers(
         )),
         Arc::new(IndexingOptimizer::new(
             optimizers_config.get_number_segments(),
-            threshold_config.clone(),
+            threshold_config,
             segments_path.clone(),
             temp_segments_path.clone(),
             collection_params.clone(),
@@ -177,7 +182,7 @@ pub fn build_optimizers(
         Arc::new(VacuumOptimizer::new(
             optimizers_config.deleted_threshold,
             optimizers_config.vacuum_min_vector_number,
-            threshold_config.clone(),
+            threshold_config,
             segments_path.clone(),
             temp_segments_path.clone(),
             collection_params.clone(),

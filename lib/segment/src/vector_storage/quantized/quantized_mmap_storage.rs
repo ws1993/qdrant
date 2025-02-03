@@ -3,6 +3,7 @@ use std::path::Path;
 use memmap2::{Mmap, MmapMut};
 use memory::madvise;
 
+#[derive(Debug)]
 pub struct QuantizedMmapStorage {
     mmap: Mmap,
 }
@@ -22,11 +23,7 @@ impl quantization::EncodedStorage for QuantizedMmapStorage {
         quantized_vector_size: usize,
         vectors_count: usize,
     ) -> std::io::Result<QuantizedMmapStorage> {
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(false)
-            .create(false)
-            .open(path)?;
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
         madvise::madvise(&mmap, madvise::get_global())?;
 

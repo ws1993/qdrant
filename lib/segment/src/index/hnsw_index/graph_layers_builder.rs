@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::collections::BinaryHeap;
 use std::path::Path;
@@ -6,15 +7,17 @@ use std::sync::atomic::AtomicUsize;
 use bitvec::prelude::BitVec;
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::types::{PointOffsetType, ScoreType, ScoredPointOffset};
+use io::file_operations::atomic_save_bin;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use rand::distributions::Uniform;
 use rand::Rng;
 
-use super::graph_links::GraphLinks;
+use super::graph_layers::GraphLayerData;
+use super::graph_links::{GraphLinks, GraphLinksFormat};
 use crate::common::operation_error::OperationResult;
 use crate::index::hnsw_index::entry_points::EntryPoints;
 use crate::index::hnsw_index::graph_layers::{GraphLayers, GraphLayersBase, LinkContainer};
-use crate::index::hnsw_index::graph_links::GraphLinksConverter;
+use crate::index::hnsw_index::graph_links::GraphLinksSerializer;
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
 use crate::index::hnsw_index::search_context::SearchContext;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
@@ -75,30 +78,92 @@ impl GraphLayersBuilder {
         self.entry_points.lock()
     }
 
-    pub fn into_graph_layers<TGraphLinks: GraphLinks>(
+    pub fn into_graph_layers(
         self,
-        path: Option<&Path>,
-    ) -> OperationResult<GraphLayers<TGraphLinks>> {
-        let unlocker_links_layers = self
-            .links_layers
-            .into_iter()
-            .map(|l| l.into_iter().map(|l| l.into_inner()).collect())
-            .collect();
+        path: &Path,
+        format: GraphLinksFormat,
+        on_disk: bool,
+    ) -> OperationResult<GraphLayers> {
+        let links_path = GraphLayers::get_links_path(path, format);
 
-        let mut links_converter = GraphLinksConverter::new(unlocker_links_layers);
-        if let Some(path) = path {
-            links_converter.save_as(path)?;
-        }
+        let serializer =
+            Self::links_layers_to_serializer(self.links_layers, format, self.m, self.m0);
+        serializer.save_as(&links_path)?;
 
-        let links = TGraphLinks::from_converter(links_converter)?;
-        Ok(GraphLayers {
+        let links = if on_disk {
+            GraphLinks::load_from_file(&links_path, true, format)?
+        } else {
+            serializer.to_graph_links_ram()
+        };
+
+        let entry_points = self.entry_points.into_inner();
+
+        let data = GraphLayerData {
             m: self.m,
             m0: self.m0,
             ef_construct: self.ef_construct,
+            entry_points: Cow::Borrowed(&entry_points),
+        };
+        atomic_save_bin(&GraphLayers::get_path(path), &data)?;
+
+        Ok(GraphLayers {
+            m: self.m,
+            m0: self.m0,
             links,
-            entry_points: self.entry_points.into_inner(),
+            entry_points,
             visited_pool: self.visited_pool,
         })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn into_graph_layers_ram(self, format: GraphLinksFormat) -> GraphLayers {
+        GraphLayers {
+            m: self.m,
+            m0: self.m0,
+            links: Self::links_layers_to_serializer(self.links_layers, format, self.m, self.m0)
+                .to_graph_links_ram(),
+            entry_points: self.entry_points.into_inner(),
+            visited_pool: self.visited_pool,
+        }
+    }
+
+    fn links_layers_to_serializer(
+        link_layers: Vec<LockedLayersContainer>,
+        format: GraphLinksFormat,
+        m: usize,
+        m0: usize,
+    ) -> GraphLinksSerializer {
+        let edges = link_layers
+            .into_iter()
+            .map(|l| l.into_iter().map(|l| l.into_inner()).collect())
+            .collect();
+        GraphLinksSerializer::new(edges, format, m, m0)
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn m(&self) -> usize {
+        self.m
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn m0(&self) -> usize {
+        self.m0
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn ef_construct(&self) -> usize {
+        self.ef_construct
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn links_layers(&self) -> &[LockedLayersContainer] {
+        &self.links_layers
+    }
+
+    #[cfg(feature = "gpu")]
+    pub fn clear_ready_list(&mut self) {
+        let num_vectors = self.num_points();
+        self.ready_list = RwLock::new(BitVec::repeat(true, num_vectors));
     }
 
     pub fn new_with_params(
@@ -206,7 +271,7 @@ impl GraphLayersBuilder {
         picked_level.round() as usize
     }
 
-    fn get_point_level(&self, point_id: PointOffsetType) -> usize {
+    pub(crate) fn get_point_level(&self, point_id: PointOffsetType) -> usize {
         self.links_layers[point_id as usize].len() - 1
     }
 
@@ -286,7 +351,7 @@ impl GraphLayersBuilder {
     }
 
     /// <https://github.com/nmslib/hnswlib/issues/99>
-    fn select_candidates_with_heuristic<F>(
+    pub(crate) fn select_candidates_with_heuristic<F>(
         candidates: FixedLengthPriorityQueue<ScoredPointOffset>,
         m: usize,
         score_internal: F,
@@ -294,7 +359,7 @@ impl GraphLayersBuilder {
     where
         F: FnMut(PointOffsetType, PointOffsetType) -> ScoreType,
     {
-        let closest_iter = candidates.into_iter();
+        let closest_iter = candidates.into_iter_sorted();
         Self::select_candidate_with_heuristic_from_sorted(closest_iter, m, score_internal)
     }
 
@@ -308,9 +373,7 @@ impl GraphLayersBuilder {
         let entry_point_opt = self
             .entry_points
             .lock()
-            .new_point(point_id, level, |point_id| {
-                points_scorer.check_vector(point_id)
-            });
+            .get_entry_point(|point_id| points_scorer.check_vector(point_id));
         match entry_point_opt {
             // New point is a new empty entry (for this filter, at least)
             // We can't do much here, so just quit
@@ -353,7 +416,7 @@ impl GraphLayersBuilder {
                         &mut points_scorer,
                     );
 
-                    if let Some(the_nearest) = search_context.nearest.iter().max() {
+                    if let Some(the_nearest) = search_context.nearest.iter_unsorted().max() {
                         level_entry = *the_nearest;
                     }
 
@@ -419,7 +482,7 @@ impl GraphLayersBuilder {
                             }
                         }
                     } else {
-                        for nearest_point in &search_context.nearest {
+                        for nearest_point in search_context.nearest.iter_unsorted() {
                             {
                                 let mut links =
                                     self.links_layers[point_id as usize][curr_level].write();
@@ -450,6 +513,11 @@ impl GraphLayersBuilder {
             }
         }
         self.ready_list.write().set(point_id as usize, true);
+        self.entry_points
+            .lock()
+            .new_point(point_id, level, |point_id| {
+                points_scorer.check_vector(point_id)
+            });
     }
 
     /// This function returns average number of links per node in HNSW graph
@@ -482,16 +550,18 @@ mod tests {
     use rand::prelude::StdRng;
     use rand::seq::SliceRandom;
     use rand::SeedableRng;
+    use rstest::rstest;
 
     use super::*;
     use crate::data_types::vectors::{DenseVector, VectorElementType};
     use crate::fixtures::index_fixtures::{
         random_vector, FakeFilterContext, TestRawScorerProducer,
     };
-    use crate::index::hnsw_index::graph_links::GraphLinksRam;
+    use crate::index::hnsw_index::graph_links::normalize_links;
     use crate::index::hnsw_index::tests::create_graph_layer_fixture;
     use crate::spaces::metric::Metric;
     use crate::spaces::simple::{CosineMetric, EuclidMetric};
+    use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
 
     const M: usize = 8;
 
@@ -535,7 +605,7 @@ mod tests {
                 .into_par_iter()
                 .for_each(|idx| {
                     let fake_filter_context = FakeFilterContext {};
-                    let added_vector = vector_holder.vectors.get(idx).to_vec();
+                    let added_vector = vector_holder.vectors.get(idx as VectorOffsetType).to_vec();
                     let raw_scorer = vector_holder.get_raw_scorer(added_vector).unwrap();
                     let scorer =
                         FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
@@ -577,7 +647,7 @@ mod tests {
 
         for idx in 0..(num_vectors as PointOffsetType) {
             let fake_filter_context = FakeFilterContext {};
-            let added_vector = vector_holder.vectors.get(idx).to_vec();
+            let added_vector = vector_holder.vectors.get(idx as VectorOffsetType).to_vec();
             let raw_scorer = vector_holder.get_raw_scorer(added_vector.clone()).unwrap();
             let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
             graph_layers.link_new_point(idx, scorer);
@@ -587,8 +657,10 @@ mod tests {
     }
 
     #[cfg(not(windows))] // https://github.com/qdrant/qdrant/issues/1452
-    #[test]
-    fn test_parallel_graph_build() {
+    #[rstest]
+    #[case::uncompressed(GraphLinksFormat::Plain)]
+    #[case::compressed(GraphLinksFormat::Compressed)]
+    fn test_parallel_graph_build(#[case] format: GraphLinksFormat) {
         let num_vectors = 1000;
         let dim = 8;
 
@@ -635,28 +707,28 @@ mod tests {
         let processed_query = <M as Metric<VectorElementType>>::preprocess(query.clone());
         let mut reference_top = FixedLengthPriorityQueue::new(top);
         for idx in 0..vector_holder.vectors.len() as PointOffsetType {
-            let vec = &vector_holder.vectors.get(idx);
+            let vec = &vector_holder.vectors.get(idx as VectorOffsetType);
             reference_top.push(ScoredPointOffset {
                 idx,
                 score: M::similarity(vec, &processed_query),
             });
         }
 
-        let graph = graph_layers_builder
-            .into_graph_layers::<GraphLinksRam>(None)
-            .unwrap();
+        let graph = graph_layers_builder.into_graph_layers_ram(format);
 
         let fake_filter_context = FakeFilterContext {};
-        let raw_scorer = vector_holder.get_raw_scorer(query.clone()).unwrap();
+        let raw_scorer = vector_holder.get_raw_scorer(query).unwrap();
         let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let ef = 16;
         let graph_search = graph.search(top, ef, scorer, None);
 
-        assert_eq!(reference_top.into_vec(), graph_search);
+        assert_eq!(reference_top.into_sorted_vec(), graph_search);
     }
 
-    #[test]
-    fn test_add_points() {
+    #[rstest]
+    #[case::uncompressed(GraphLinksFormat::Plain)]
+    #[case::compressed(GraphLinksFormat::Compressed)]
+    fn test_add_points(#[case] format: GraphLinksFormat) {
         let num_vectors = 1000;
         let dim = 8;
 
@@ -669,7 +741,7 @@ mod tests {
             create_graph_layer::<M, _>(num_vectors, dim, false, &mut rng);
 
         let (_vector_holder_orig, graph_layers_orig) =
-            create_graph_layer_fixture::<M, _>(num_vectors, M, dim, false, &mut rng2, None);
+            create_graph_layer_fixture::<M, _>(num_vectors, M, dim, format, false, &mut rng2);
 
         // check is graph_layers_builder links are equal to graph_layers_orig
         let orig_len = graph_layers_orig.links.num_points();
@@ -678,10 +750,17 @@ mod tests {
         assert_eq!(orig_len, builder_len);
 
         for idx in 0..builder_len {
-            let links_orig = &graph_layers_orig.links.links(idx as PointOffsetType, 0);
+            let links_orig = &graph_layers_orig.links.links_vec(idx as PointOffsetType, 0);
             let links_builder = graph_layers_builder.links_layers[idx][0].read();
             let link_container_from_builder = links_builder.iter().copied().collect::<Vec<_>>();
-            assert_eq!(links_orig, &link_container_from_builder);
+            let m = match format {
+                GraphLinksFormat::Plain => 0,
+                GraphLinksFormat::Compressed => M * 2,
+            };
+            assert_eq!(
+                normalize_links(m, links_orig.clone()),
+                normalize_links(m, link_container_from_builder),
+            );
         }
 
         let main_entry = graph_layers_builder
@@ -718,29 +797,27 @@ mod tests {
         let processed_query = <M as Metric<VectorElementType>>::preprocess(query.clone());
         let mut reference_top = FixedLengthPriorityQueue::new(top);
         for idx in 0..vector_holder.vectors.len() as PointOffsetType {
-            let vec = &vector_holder.vectors.get(idx);
+            let vec = &vector_holder.vectors.get(idx as VectorOffsetType);
             reference_top.push(ScoredPointOffset {
                 idx,
                 score: M::similarity(vec, &processed_query),
             });
         }
 
-        let graph = graph_layers_builder
-            .into_graph_layers::<GraphLinksRam>(None)
-            .unwrap();
+        let graph = graph_layers_builder.into_graph_layers_ram(format);
 
         let fake_filter_context = FakeFilterContext {};
         let raw_scorer = vector_holder.get_raw_scorer(query).unwrap();
         let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
         let ef = 16;
         let graph_search = graph.search(top, ef, scorer, None);
-
-        assert_eq!(reference_top.into_vec(), graph_search);
+        assert_eq!(reference_top.into_sorted_vec(), graph_search);
     }
 
-    #[test]
-    #[ignore]
-    fn test_hnsw_graph_properties() {
+    #[rstest]
+    #[case::uncompressed(GraphLinksFormat::Plain)]
+    #[case::compressed(GraphLinksFormat::Compressed)]
+    fn test_hnsw_graph_properties(#[case] format: GraphLinksFormat) {
         const NUM_VECTORS: usize = 5_000;
         const DIM: usize = 16;
         const M: usize = 16;
@@ -754,16 +831,14 @@ mod tests {
             GraphLayersBuilder::new(NUM_VECTORS, M, M * 2, EF_CONSTRUCT, 10, USE_HEURISTIC);
         let fake_filter_context = FakeFilterContext {};
         for idx in 0..(NUM_VECTORS as PointOffsetType) {
-            let added_vector = vector_holder.vectors.get(idx).to_vec();
+            let added_vector = vector_holder.vectors.get(idx as VectorOffsetType).to_vec();
             let raw_scorer = vector_holder.get_raw_scorer(added_vector).unwrap();
             let scorer = FilteredScorer::new(raw_scorer.as_ref(), Some(&fake_filter_context));
             let level = graph_layers_builder.get_random_layer(&mut rng);
             graph_layers_builder.set_levels(idx, level);
             graph_layers_builder.link_new_point(idx, scorer);
         }
-        let graph_layers = graph_layers_builder
-            .into_graph_layers::<GraphLinksRam>(None)
-            .unwrap();
+        let graph_layers = graph_layers_builder.into_graph_layers_ram(format);
 
         let num_points = graph_layers.links.num_points();
         eprintln!("number_points = {num_points:#?}");
@@ -776,12 +851,12 @@ mod tests {
 
         let layers910 = graph_layers.links.point_level(910);
         let links910 = (0..layers910 + 1)
-            .map(|i| graph_layers.links.links(910, i).to_vec())
+            .map(|i| graph_layers.links.links_vec(910, i))
             .collect::<Vec<_>>();
         eprintln!("graph_layers.links_layers[910] = {links910:#?}",);
 
         let total_edges: usize = (0..NUM_VECTORS)
-            .map(|i| graph_layers.links.links(i as PointOffsetType, 0).len())
+            .map(|i| graph_layers.links.links_vec(i as PointOffsetType, 0).len())
             .sum();
         let avg_connectivity = total_edges as f64 / NUM_VECTORS as f64;
         eprintln!("avg_connectivity = {avg_connectivity:#?}");
@@ -812,7 +887,7 @@ mod tests {
             });
         }
 
-        let sorted_candidates = candidates.into_vec();
+        let sorted_candidates = candidates.into_sorted_vec();
 
         for x in sorted_candidates.iter().take(M) {
             eprintln!("sorted_candidates = ({}, {})", x.idx, x.score);

@@ -5,11 +5,13 @@ use std::sync::Arc;
 use actix_web::body::{BoxBody, EitherBody};
 use actix_web::dev::{forward_ready, Service, ServiceRequest, ServiceResponse, Transform};
 use actix_web::{Error, FromRequest, HttpMessage, HttpResponse, ResponseError};
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures_util::future::LocalBoxFuture;
 use storage::rbac::Access;
 
 use super::helpers::HttpError;
 use crate::common::auth::{AuthError, AuthKeys};
+use crate::common::inference::InferenceToken;
 
 pub struct Auth {
     auth_keys: AuthKeys,
@@ -109,22 +111,28 @@ where
 
     fn call(&self, req: ServiceRequest) -> Self::Future {
         let path = req.path();
-
         if self.is_path_whitelisted(path) {
             return Box::pin(self.service.call(req));
         }
+
+        let hw_acc = HwMeasurementAcc::disposable(); // TODO(io_measurement) use this value!
 
         let auth_keys = self.auth_keys.clone();
         let service = self.service.clone();
         Box::pin(async move {
             match auth_keys
-                .validate_request(|key| req.headers().get(key).and_then(|val| val.to_str().ok()))
+                .validate_request(
+                    |key| req.headers().get(key).and_then(|val| val.to_str().ok()),
+                    hw_acc,
+                )
                 .await
             {
-                Ok(access) => {
-                    let _previous = req.extensions_mut().insert::<Access>(access);
+                Ok((access, api_key)) => {
+                    let previous = req.extensions_mut().insert::<Access>(access);
+                    req.extensions_mut()
+                        .insert(InferenceToken::new(api_key.to_string()));
                     debug_assert!(
-                        _previous.is_none(),
+                        previous.is_none(),
                         "Previous access object should not exist in the request"
                     );
                     service.call(req).await

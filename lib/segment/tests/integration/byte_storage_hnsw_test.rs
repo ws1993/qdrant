@@ -11,20 +11,15 @@ use rstest::rstest;
 use segment::data_types::vectors::{only_default_vector, QueryVector, DEFAULT_VECTOR_NAME};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_dense_byte_vector, random_int_payload};
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
-use segment::index::hnsw_index::hnsw::HNSWIndex;
+use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::{PayloadIndex, VectorIndex};
-use segment::json_path::path;
 use segment::segment_constructor::build_segment;
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload, Range, SearchParams,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Range, SearchParams,
     SegmentConfig, SeqNumberType, VectorDataConfig, VectorStorageDatatype, VectorStorageType,
 };
-use segment::vector_storage::query::context_query::ContextPair;
-use segment::vector_storage::query::discovery_query::DiscoveryQuery;
-use segment::vector_storage::query::reco_query::RecoQuery;
+use segment::vector_storage::query::{ContextPair, DiscoveryQuery, RecoQuery};
 use segment::vector_storage::VectorStorageEnum;
-use serde_json::json;
 use tempfile::Builder;
 
 const MAX_EXAMPLE_PAIRS: usize = 4;
@@ -78,21 +73,32 @@ fn compare_search_result(result_a: &[Vec<ScoredPointOffset>], result_b: &[Vec<Sc
         assert_eq!(a.len(), b.len());
         for (a, b) in a.iter().zip(b) {
             assert_eq!(a.idx, b.idx);
-            assert!((a.score - b.score).abs() < 1e-6);
+            assert!((a.score - b.score).abs() < 1e-3);
         }
     }
 }
 
 #[rstest]
-#[case::nearest(QueryVariant::Nearest, 32, 10)]
-#[case::discovery(QueryVariant::Discovery, 128, 20)]
-#[case::recommend(QueryVariant::RecommendBestScore, 64, 20)]
+#[case::nearest(QueryVariant::Nearest, VectorStorageDatatype::Uint8, 32, 10)]
+#[case::nearest(QueryVariant::Nearest, VectorStorageDatatype::Float16, 32, 10)]
+#[case::discovery(QueryVariant::Discovery, VectorStorageDatatype::Uint8, 128, 20)]
+#[case::recommend(
+    QueryVariant::RecommendBestScore,
+    VectorStorageDatatype::Float16,
+    64,
+    20
+)]
 fn test_byte_storage_hnsw(
     #[case] query_variant: QueryVariant,
+    #[case] storage_data_type: VectorStorageDatatype,
     #[case] ef: usize,
     #[case] max_failures: usize, // out of 100
 ) {
+    use common::counter::hardware_counter::HardwareCounterCell;
     use segment::index::hnsw_index::num_rayon_threads;
+    use segment::json_path::JsonPath;
+    use segment::payload_json;
+    use segment::segment_constructor::VectorIndexBuildArgs;
     use segment::types::PayloadSchemaType;
 
     let stopped = AtomicBool::new(false);
@@ -102,7 +108,7 @@ fn test_byte_storage_hnsw(
     let num_vectors: u64 = 5_000;
     let ef_construct = 16;
     let distance = Distance::Cosine;
-    let full_scan_threshold = 16; // KB
+    let full_scan_threshold = 0;
     let num_payload_values = 2;
 
     let mut rnd = StdRng::seed_from_u64(42);
@@ -123,7 +129,7 @@ fn test_byte_storage_hnsw(
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
-                multivec_config: None,
+                multivector_config: None,
                 datatype: None,
             },
         )]),
@@ -139,8 +145,8 @@ fn test_byte_storage_hnsw(
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
-                multivec_config: None,
-                datatype: Some(VectorStorageDatatype::Uint8),
+                multivector_config: None,
+                datatype: Some(storage_data_type),
             },
         )]),
         sparse_vector_data: Default::default(),
@@ -151,16 +157,16 @@ fn test_byte_storage_hnsw(
 
     let mut segment_float = build_segment(dir_float.path(), &config_float, true).unwrap();
     let mut segment_byte = build_segment(dir_byte.path(), &config_byte, true).unwrap();
-    // check that `segment_byte` uses byte storage
+    // check that `segment_byte` uses byte or half storage
     {
         let borrowed_storage = segment_byte.vector_data[DEFAULT_VECTOR_NAME]
             .vector_storage
             .borrow();
         let raw_storage: &VectorStorageEnum = &borrowed_storage;
-        assert!(matches!(
-            raw_storage,
-            &VectorStorageEnum::DenseSimpleByte(_)
-        ));
+        assert!(
+            matches!(raw_storage, &VectorStorageEnum::DenseSimpleByte(_))
+                | matches!(raw_storage, &VectorStorageEnum::DenseSimpleHalf(_))
+        );
     }
 
     for n in 0..num_vectors {
@@ -168,31 +174,43 @@ fn test_byte_storage_hnsw(
         let vector = random_dense_byte_vector(&mut rnd, dim);
 
         let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
-        let payload: Payload = json!({int_key:int_payload,}).into();
+        let payload = payload_json! {int_key: int_payload};
+
+        let hw_counter = HardwareCounterCell::new();
 
         segment_float
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
         segment_float
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
         segment_byte
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
         segment_byte
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
     }
 
     segment_float
         .payload_index
         .borrow_mut()
-        .set_indexed(&path(int_key), PayloadSchemaType::Integer.into())
+        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
         .unwrap();
     segment_byte
         .payload_index
         .borrow_mut()
-        .set_indexed(&path(int_key), PayloadSchemaType::Integer.into())
+        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
         .unwrap();
 
     let hnsw_config = HnswConfig {
@@ -206,21 +224,27 @@ fn test_byte_storage_hnsw(
 
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
     let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
-    let mut hnsw_index_byte = HNSWIndex::<GraphLinksRam>::open(
-        hnsw_dir_byte.path(),
-        segment_byte.id_tracker.clone(),
-        segment_byte.vector_data[DEFAULT_VECTOR_NAME]
-            .vector_storage
-            .clone(),
-        segment_byte.vector_data[DEFAULT_VECTOR_NAME]
-            .quantized_vectors
-            .clone(),
-        segment_byte.payload_index.clone(),
-        hnsw_config,
+    let hnsw_index_byte = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir_byte.path(),
+            id_tracker: segment_byte.id_tracker.clone(),
+            vector_storage: segment_byte.vector_data[DEFAULT_VECTOR_NAME]
+                .vector_storage
+                .clone(),
+            quantized_vectors: segment_byte.vector_data[DEFAULT_VECTOR_NAME]
+                .quantized_vectors
+                .clone(),
+            payload_index: segment_byte.payload_index.clone(),
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+        },
     )
     .unwrap();
-
-    hnsw_index_byte.build_index(permit, &stopped).unwrap();
 
     let top = 3;
     let mut hits = 0;
@@ -233,12 +257,12 @@ fn test_byte_storage_hnsw(
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(
-            path(int_key),
+            JsonPath::new(int_key),
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(left_range as f64),
-                lte: Some(right_range as f64),
+                gte: Some(f64::from(left_range)),
+                lte: Some(f64::from(right_range)),
             },
         )));
 
@@ -276,7 +300,9 @@ fn test_byte_storage_hnsw(
             .borrow()
             .search(&[&query], filter_query, top, None, &Default::default())
             .unwrap();
-        compare_search_result(&plain_result_float, &plain_result_byte);
+        if storage_data_type == VectorStorageDatatype::Uint8 {
+            compare_search_result(&plain_result_float, &plain_result_byte);
+        }
 
         if plain_result_byte == index_result_byte {
             hits += 1;

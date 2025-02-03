@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write};
 use std::num::NonZeroU32;
@@ -11,10 +11,13 @@ use segment::common::anonymize::Anonymize;
 use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::types::{
-    Distance, HnswConfig, Indexes, PayloadStorageType, QuantizationConfig, SparseVectorDataConfig,
-    VectorDataConfig, VectorStorageDatatype, VectorStorageType,
+    default_replication_factor_const, default_shard_number_const,
+    default_write_consistency_factor_const, Distance, HnswConfig, Indexes, PayloadStorageType,
+    QuantizationConfig, SparseVectorDataConfig, StrictModeConfig, VectorDataConfig, VectorName,
+    VectorNameBuf, VectorStorageDatatype, VectorStorageType,
 };
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use validator::Validate;
 use wal::WalOptions;
 
@@ -67,7 +70,7 @@ pub enum ShardingMethod {
 #[serde(rename_all = "snake_case")]
 pub struct CollectionParams {
     /// Configuration of the vector storage
-    #[validate]
+    #[validate(nested)]
     #[serde(default)]
     pub vectors: VectorsConfig,
     /// Number of shards the collection has
@@ -98,21 +101,71 @@ pub struct CollectionParams {
     /// It will be read from the disk every time it is requested.
     /// This setting saves RAM by (slightly) increasing the response time.
     /// Note: those payload values that are involved in filtering and are indexed - remain in RAM.
+    ///
+    /// Default: true
     #[serde(default = "default_on_disk_payload")]
     pub on_disk_payload: bool,
     /// Configuration of the sparse vector storage
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[validate]
-    pub sparse_vectors: Option<BTreeMap<String, SparseVectorParams>>,
+    #[validate(nested)]
+    pub sparse_vectors: Option<BTreeMap<VectorNameBuf, SparseVectorParams>>,
 }
 
 impl CollectionParams {
     pub fn payload_storage_type(&self) -> PayloadStorageType {
         if self.on_disk_payload {
-            PayloadStorageType::OnDisk
+            PayloadStorageType::Mmap
         } else {
             PayloadStorageType::InMemory
         }
+    }
+
+    pub fn check_compatible(&self, other: &CollectionParams) -> CollectionResult<()> {
+        let CollectionParams {
+            vectors,
+            shard_number: _, // Maybe be updated by resharding, assume local shards needs to be dropped
+            sharding_method, // Not changeable
+            replication_factor: _, // May be changed
+            write_consistency_factor: _, // May be changed
+            read_fan_out_factor: _, // May be changed
+            on_disk_payload: _, // May be changed
+            sparse_vectors,  // Parameters may be changes, but not the structure
+        } = other;
+
+        self.vectors.check_compatible(vectors)?;
+
+        let this_sparse_vectors: HashSet<_> = if let Some(sparse_vectors) = &self.sparse_vectors {
+            sparse_vectors.keys().collect()
+        } else {
+            HashSet::new()
+        };
+
+        let other_sparse_vectors: HashSet<_> = if let Some(sparse_vectors) = sparse_vectors {
+            sparse_vectors.keys().collect()
+        } else {
+            HashSet::new()
+        };
+
+        if this_sparse_vectors != other_sparse_vectors {
+            return Err(CollectionError::bad_input(format!(
+                "sparse vectors are incompatible: \
+                 origin sparse vectors: {this_sparse_vectors:?}, \
+                 while other sparse vectors: {other_sparse_vectors:?}",
+            )));
+        }
+
+        let this_sharding_method = self.sharding_method.unwrap_or_default();
+        let other_sharding_method = sharding_method.unwrap_or_default();
+
+        if this_sharding_method != other_sharding_method {
+            return Err(CollectionError::bad_input(format!(
+                "sharding method is incompatible: \
+                 origin sharding method: {this_sharding_method:?}, \
+                 while other sharding method: {other_sharding_method:?}",
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -132,36 +185,44 @@ impl Anonymize for CollectionParams {
 }
 
 pub fn default_shard_number() -> NonZeroU32 {
-    NonZeroU32::new(1).unwrap()
+    NonZeroU32::new(default_shard_number_const()).unwrap()
 }
 
 pub fn default_replication_factor() -> NonZeroU32 {
-    NonZeroU32::new(1).unwrap()
+    NonZeroU32::new(default_replication_factor_const()).unwrap()
 }
 
 pub fn default_write_consistency_factor() -> NonZeroU32 {
-    NonZeroU32::new(1).unwrap()
+    NonZeroU32::new(default_write_consistency_factor_const()).unwrap()
 }
 
-const fn default_on_disk_payload() -> bool {
-    false
+pub const fn default_on_disk_payload() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
-pub struct CollectionConfig {
-    #[validate]
+pub struct CollectionConfigInternal {
+    #[validate(nested)]
     pub params: CollectionParams,
-    #[validate]
+    #[validate(nested)]
     pub hnsw_config: HnswConfig,
-    #[validate]
+    #[validate(nested)]
     pub optimizer_config: OptimizersConfig,
-    #[validate]
+    #[validate(nested)]
     pub wal_config: WalConfig,
     #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strict_mode_config: Option<StrictModeConfig>,
+    #[serde(default)]
+    pub uuid: Option<Uuid>,
 }
 
-impl CollectionConfig {
+impl CollectionConfigInternal {
+    pub fn to_bytes(&self) -> CollectionResult<Vec<u8>> {
+        serde_json::to_vec(self).map_err(|err| CollectionError::service_error(err.to_string()))
+    }
+
     pub fn save(&self, path: &Path) -> CollectionResult<()> {
         let config_path = path.join(COLLECTION_CONFIG_FILE);
         let af = AtomicFile::new(&config_path, AllowOverwrite);
@@ -207,33 +268,72 @@ impl CollectionParams {
         }
     }
 
-    pub fn get_distance(&self, vector_name: &str) -> CollectionResult<Distance> {
-        match self.vectors.get_params(vector_name) {
-            Some(params) => Ok(params.distance),
-            None => {
-                if let Some(sparse_vectors) = &self.sparse_vectors {
-                    sparse_vectors
-                        .get(vector_name)
-                        .ok_or_else(|| CollectionError::BadInput {
-                            description: format!(
-                                "Vector params for {vector_name} are not specified in config",
-                                vector_name = vector_name
-                            ),
-                        })
-                        .map(|_params| Distance::Dot)
-                } else {
-                    Err(CollectionError::BadInput {
-                        description: format!(
-                            "Vector params for {vector_name} are not specified in config",
-                            vector_name = vector_name
-                        ),
-                    })
+    fn missing_vector_error(&self, vector_name: &VectorName) -> CollectionError {
+        let mut available_names = vec![];
+
+        match &self.vectors {
+            VectorsConfig::Single(_) => {
+                available_names.push(DEFAULT_VECTOR_NAME.to_owned());
+            }
+            VectorsConfig::Multi(vectors) => {
+                for name in vectors.keys() {
+                    available_names.push(name.clone());
                 }
+            }
+        }
+
+        if let Some(sparse_vectors) = &self.sparse_vectors {
+            for name in sparse_vectors.keys() {
+                available_names.push(name.clone());
+            }
+        }
+
+        if available_names.is_empty() {
+            CollectionError::BadInput {
+                description: "Vectors are not configured in this collection".into(),
+            }
+        } else if available_names == vec![DEFAULT_VECTOR_NAME] {
+            return CollectionError::BadInput {
+                description: format!(
+                    "Vector with name {vector_name} is not configured in this collection"
+                ),
+            };
+        } else {
+            let available_names = available_names.join(", ");
+            if vector_name == DEFAULT_VECTOR_NAME {
+                return CollectionError::BadInput {
+                    description: format!(
+                        "Collection requires specified vector name in the request, available names: {available_names}"
+                    ),
+                };
+            }
+
+            CollectionError::BadInput {
+                description: format!(
+                    "Vector with name `{vector_name}` is not configured in this collection, available names: {available_names}"
+                ),
             }
         }
     }
 
-    fn get_vector_params_mut(&mut self, vector_name: &str) -> CollectionResult<&mut VectorParams> {
+    pub fn get_distance(&self, vector_name: &VectorName) -> CollectionResult<Distance> {
+        match self.vectors.get_params(vector_name) {
+            Some(params) => Ok(params.distance),
+            None => {
+                if let Some(sparse_vectors) = &self.sparse_vectors {
+                    if let Some(_params) = sparse_vectors.get(vector_name) {
+                        return Ok(Distance::Dot);
+                    }
+                }
+                Err(self.missing_vector_error(vector_name))
+            }
+        }
+    }
+
+    fn get_vector_params_mut(
+        &mut self,
+        vector_name: &VectorName,
+    ) -> CollectionResult<&mut VectorParams> {
         self.vectors
             .get_params_mut(vector_name)
             .ok_or_else(|| CollectionError::BadInput {
@@ -245,7 +345,10 @@ impl CollectionParams {
             })
     }
 
-    pub fn get_sparse_vector_params_opt(&self, vector_name: &str) -> Option<&SparseVectorParams> {
+    pub fn get_sparse_vector_params_opt(
+        &self,
+        vector_name: &VectorName,
+    ) -> Option<&SparseVectorParams> {
         self.sparse_vectors
             .as_ref()
             .and_then(|sparse_vectors| sparse_vectors.get(vector_name))
@@ -253,16 +356,20 @@ impl CollectionParams {
 
     pub fn get_sparse_vector_params_mut(
         &mut self,
-        vector_name: &str,
+        vector_name: &VectorName,
     ) -> CollectionResult<&mut SparseVectorParams> {
         self.sparse_vectors
             .as_mut()
             .ok_or_else(|| CollectionError::BadInput {
-                description: format!("Vector params for {vector_name} are not specified in config"),
+                description: format!(
+                    "Sparse vector `{vector_name}` is not specified in collection config"
+                ),
             })?
             .get_mut(vector_name)
             .ok_or_else(|| CollectionError::BadInput {
-                description: format!("Vector params for {vector_name} are not specified in config"),
+                description: format!(
+                    "Sparse vector `{vector_name}` is not specified in collection config"
+                ),
             })
     }
 
@@ -324,9 +431,9 @@ impl CollectionParams {
 
             if let Some(index) = index {
                 if let Some(existing_index) = &mut sparse_vector_params.index {
-                    existing_index.update_from_other(&index);
+                    existing_index.update_from_other(index);
                 } else {
-                    sparse_vector_params.index = Some(index);
+                    sparse_vector_params.index.replace(index);
                 }
             }
         }
@@ -337,7 +444,9 @@ impl CollectionParams {
     ///
     /// It is the job of the segment optimizer to change this configuration with optimized settings
     /// based on threshold configurations.
-    pub fn to_base_vector_data(&self) -> CollectionResult<HashMap<String, VectorDataConfig>> {
+    pub fn to_base_vector_data(
+        &self,
+    ) -> CollectionResult<HashMap<VectorNameBuf, VectorDataConfig>> {
         Ok(self
             .vectors
             .params_iter()
@@ -355,9 +464,9 @@ impl CollectionParams {
                         storage_type: if params.on_disk.unwrap_or_default() {
                             VectorStorageType::ChunkedMmap
                         } else {
-                            VectorStorageType::Memory
+                            VectorStorageType::InRamChunkedMmap
                         },
-                        multivec_config: params.multivec_config,
+                        multivector_config: params.multivector_config,
                         datatype: params.datatype.map(VectorStorageDatatype::from),
                     },
                 )
@@ -371,24 +480,29 @@ impl CollectionParams {
     /// based on threshold configurations.
     pub fn to_sparse_vector_data(
         &self,
-    ) -> CollectionResult<HashMap<String, SparseVectorDataConfig>> {
+    ) -> CollectionResult<HashMap<VectorNameBuf, SparseVectorDataConfig>> {
         if let Some(sparse_vectors) = &self.sparse_vectors {
-            Ok(sparse_vectors
+            sparse_vectors
                 .iter()
                 .map(|(name, params)| {
-                    (
-                        name.into(),
+                    Ok((
+                        name.clone(),
                         SparseVectorDataConfig {
                             index: SparseIndexConfig {
                                 full_scan_threshold: params
                                     .index
                                     .and_then(|index| index.full_scan_threshold),
                                 index_type: SparseIndexType::MutableRam,
+                                datatype: params
+                                    .index
+                                    .and_then(|index| index.datatype)
+                                    .map(VectorStorageDatatype::from),
                             },
+                            storage_type: params.storage_type(),
                         },
-                    )
+                    ))
                 })
-                .collect())
+                .collect()
         } else {
             Ok(Default::default())
         }

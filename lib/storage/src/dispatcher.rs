@@ -1,9 +1,14 @@
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use api::rest::models::HardwareUsage;
 use collection::config::ShardingMethod;
+use collection::operations::verification::VerificationPass;
+use common::counter::hardware_accumulator::HwSharedDrain;
 use common::defaults::CONSENSUS_META_OP_WAIT;
+use segment::types::default_shard_number_per_node_const;
 
 use crate::content_manager::collection_meta_ops::AliasOperations;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
@@ -17,6 +22,7 @@ use crate::{
 pub struct Dispatcher {
     toc: Arc<TableOfContent>,
     consensus_state: Option<ConsensusStateRef>,
+    resharding_enabled: bool,
 }
 
 impl Dispatcher {
@@ -24,25 +30,35 @@ impl Dispatcher {
         Self {
             toc,
             consensus_state: None,
+            resharding_enabled: false,
         }
     }
 
-    pub fn with_consensus(self, state_ref: ConsensusStateRef) -> Self {
+    pub fn with_consensus(self, state_ref: ConsensusStateRef, resharding_enabled: bool) -> Self {
         Self {
             consensus_state: Some(state_ref),
+            resharding_enabled,
             ..self
         }
     }
 
     /// Get the table of content.
-    /// The `_access` parameter is not used, but it's required to verify caller's possession
-    /// of the [Access] object.
-    pub fn toc(&self, _access: &Access) -> &Arc<TableOfContent> {
+    /// The `_access` and `_verification_pass` parameter are not used, but it's required to verify caller's possession
+    /// of both objects.
+    pub fn toc(
+        &self,
+        _access: &Access,
+        _verification_pass: &VerificationPass,
+    ) -> &Arc<TableOfContent> {
         &self.toc
     }
 
     pub fn consensus_state(&self) -> Option<&ConsensusStateRef> {
         self.consensus_state.as_ref()
+    }
+
+    pub fn is_resharding_enabled(&self) -> bool {
+        self.resharding_enabled
     }
 
     /// If `wait_timeout` is not supplied - then default duration will be used.
@@ -70,14 +86,22 @@ impl Dispatcher {
                             ShardingMethod::Auto => {
                                 // Suggest even distribution of shards across nodes
                                 let number_of_peers = state.0.peer_count();
-                                let shard_distribution = self
+
+                                let shard_nr_per_node = self
                                     .toc
-                                    .suggest_shard_distribution(
-                                        &op,
-                                        NonZeroU32::new(number_of_peers as u32)
-                                            .expect("Peer count should be always >= 1"),
-                                    )
-                                    .await;
+                                    .storage_config
+                                    .collection
+                                    .as_ref()
+                                    .map(|i| i.shard_number_per_node)
+                                    .unwrap_or(default_shard_number_per_node_const());
+
+                                let suggested_shard_nr = number_of_peers as u32 * shard_nr_per_node;
+
+                                let shard_distribution = self.toc.suggest_shard_distribution(
+                                    &op,
+                                    NonZeroU32::new(suggested_shard_nr)
+                                        .expect("Peer count should be always >= 1"),
+                                );
 
                                 // Expect all replicas to become active eventually
                                 for (shard_id, peer_ids) in &shard_distribution.distribution {
@@ -101,6 +125,18 @@ impl Dispatcher {
                             }
                         }
                     }
+
+                    if let Some(uuid) = &op.create_collection.uuid {
+                        log::warn!(
+                            "Collection UUID {uuid} explicitly specified, \
+                             when proposing create collection {} operation, \
+                             new random UUID will be generated instead",
+                            op.collection_name,
+                        );
+                    }
+
+                    op.create_collection.uuid = Some(uuid::Uuid::new_v4());
+
                     CollectionMetaOperations::CreateCollection(op)
                 }
                 CollectionMetaOperations::CreateShardKey(op) => {
@@ -125,6 +161,7 @@ impl Dispatcher {
                 // Sync nodes after collection or shard key creation
                 CollectionMetaOperations::CreateCollection(_)
                 | CollectionMetaOperations::CreateShardKey(_) => true,
+
                 // Sync nodes when creating or renaming collection aliases
                 CollectionMetaOperations::ChangeAliases(changes) => {
                     changes.actions.iter().any(|change| match change {
@@ -132,6 +169,10 @@ impl Dispatcher {
                         AliasOperations::DeleteAlias(_) => false,
                     })
                 }
+
+                // TODO(resharding): Do we need/want to synchronize `Resharding` operations?
+                CollectionMetaOperations::Resharding(_, _) => false,
+
                 // No need to sync nodes for other operations
                 CollectionMetaOperations::UpdateCollection(_)
                 | CollectionMetaOperations::DeleteCollection(_)
@@ -213,5 +254,14 @@ impl Dispatcher {
         } else {
             Ok(())
         }
+    }
+
+    pub fn all_hw_metrics(&self) -> HashMap<String, HardwareUsage> {
+        self.toc.all_hw_metrics()
+    }
+
+    #[must_use]
+    pub fn get_collection_hw_metrics(&self, collection: String) -> HwSharedDrain {
+        self.toc.get_collection_hw_metrics(collection)
     }
 }

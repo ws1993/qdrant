@@ -7,8 +7,8 @@ echo $PWD
 cd "$(dirname "$0")/../../"
 
 QDRANT_HOST='localhost:6333'
-PREV_PATCH_QDRANT_VERSION='v1.8.1'
-PREV_MINOR_QDRANT_VERSION='v1.7.4'
+PREV_PATCH_QDRANT_VERSION='v1.12.6'
+PREV_MINOR_QDRANT_VERSION='v1.11.5'
 
 RETRY_LIMIT=30
 
@@ -116,10 +116,16 @@ function test_version() {
 }
 
 # Build
-cargo build
+cargo build --features data-consistency-check
 
 # Test previous patch version
 test_version $PREV_PATCH_QDRANT_VERSION
 
 # Test previous minor version
 test_version $PREV_MINOR_QDRANT_VERSION
+
+# Test blob_store storage generated manually with
+# export QDRANT__STORAGE__ON_DISK_PAYLOAD_USES_MMAP=true
+# export QDRANT__STORAGE__ON_DISK_SPARSE_VECTORS_USES_MMAP=true
+# in the gen_storage_compat_data.sh script
+test_version 'v1.12.6-blob-store'

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::cpu::CpuPermit;
 use common::types::PointOffsetType;
 use itertools::Itertools;
@@ -9,17 +10,16 @@ use rand::{thread_rng, Rng};
 use segment::data_types::vectors::{only_default_vector, DEFAULT_VECTOR_NAME};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_vector};
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
-use segment::index::hnsw_index::hnsw::HNSWIndex;
+use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{PayloadIndex, VectorIndex};
-use segment::json_path::path;
-use segment::segment_constructor::build_segment;
+use segment::json_path::JsonPath;
+use segment::payload_json;
+use segment::segment_constructor::{build_segment, VectorIndexBuildArgs};
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload, PayloadSchemaType,
-    Range, SearchParams, SegmentConfig, SeqNumberType, VectorDataConfig, VectorStorageType,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, PayloadSchemaType, Range,
+    SearchParams, SegmentConfig, SeqNumberType, VectorDataConfig, VectorStorageType,
 };
-use serde_json::json;
 use tempfile::Builder;
 
 #[test]
@@ -50,7 +50,7 @@ fn exact_search_test() {
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
-                multivec_config: None,
+                multivector_config: None,
                 datatype: None,
             },
         )]),
@@ -60,19 +60,26 @@ fn exact_search_test() {
 
     let int_key = "int";
 
+    let hw_counter = HardwareCounterCell::new();
+
     let mut segment = build_segment(dir.path(), &config, true).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
         let vector = random_vector(&mut rnd, dim);
 
         let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
-        let payload: Payload = json!({int_key:int_payload,}).into();
+        let payload = payload_json! {int_key: int_payload};
 
         segment
-            .upsert_point(n as SeqNumberType, idx, only_default_vector(&vector))
+            .upsert_point(
+                n as SeqNumberType,
+                idx,
+                only_default_vector(&vector),
+                &hw_counter,
+            )
             .unwrap();
         segment
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
     }
     // let opnum = num_vectors + 1;
@@ -88,32 +95,13 @@ fn exact_search_test() {
         payload_m: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
-    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
-
-    let mut hnsw_index = HNSWIndex::<GraphLinksRam>::open(
-        hnsw_dir.path(),
-        segment.id_tracker.clone(),
-        segment.vector_data[DEFAULT_VECTOR_NAME]
-            .vector_storage
-            .clone(),
-        segment.vector_data[DEFAULT_VECTOR_NAME]
-            .quantized_vectors
-            .clone(),
-        payload_index_ptr.clone(),
-        hnsw_config,
-    )
-    .unwrap();
-
-    hnsw_index.build_index(permit.clone(), &stopped).unwrap();
-
     payload_index_ptr
         .borrow_mut()
-        .set_indexed(&path(int_key), PayloadSchemaType::Integer.into())
+        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
         .unwrap();
     let borrowed_payload_index = payload_index_ptr.borrow();
     let blocks = borrowed_payload_index
-        .payload_blocks(&path(int_key), indexing_threshold)
+        .payload_blocks(&JsonPath::new(int_key), indexing_threshold)
         .collect_vec();
     for block in blocks.iter() {
         assert!(
@@ -126,7 +114,7 @@ fn exact_search_test() {
     for block in &blocks {
         let px = payload_index_ptr.borrow();
         let filter = Filter::new_must(Condition::Field(block.condition.clone()));
-        let points = px.query_points(&filter);
+        let points = px.query_points(&filter, &hw_counter);
         for point in points {
             coverage.insert(point, coverage.get(&point).unwrap_or(&0) + 1);
         }
@@ -145,7 +133,29 @@ fn exact_search_test() {
         "not all points are covered by payload blocks"
     );
 
-    hnsw_index.build_index(permit, &stopped).unwrap();
+    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
+    let hnsw_index = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: segment.vector_data[DEFAULT_VECTOR_NAME]
+                .vector_storage
+                .clone(),
+            quantized_vectors: segment.vector_data[DEFAULT_VECTOR_NAME]
+                .quantized_vectors
+                .clone(),
+            payload_index: payload_index_ptr.clone(),
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+        },
+    )
+    .unwrap();
 
     let top = 3;
     let attempts = 50;
@@ -181,12 +191,12 @@ fn exact_search_test() {
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(
-            path(int_key),
+            JsonPath::new(int_key),
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(left_range as f64),
-                lte: Some(right_range as f64),
+                gte: Some(f64::from(left_range)),
+                lte: Some(f64::from(right_range)),
             },
         )));
 

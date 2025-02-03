@@ -2,6 +2,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use collection::operations::vector_params_builder::VectorParamsBuilder;
+use collection::operations::verification::new_unchecked_verification_pass;
 use collection::optimizers_builder::OptimizersConfig;
 use collection::shards::channel_service::ChannelService;
 use common::cpu::CpuBudget;
@@ -33,7 +34,7 @@ fn test_alias_operation() {
             .to_str()
             .unwrap()
             .to_string(),
-        s3_config: None,
+        snapshots_config: Default::default(),
         temp_path: None,
         on_disk_payload: false,
         optimizers: OptimizersConfig {
@@ -46,6 +47,7 @@ fn test_alias_operation() {
             flush_interval_sec: 2,
             max_optimization_threads: Some(2),
         },
+        optimizers_overwrite: None,
         wal: Default::default(),
         performance: PerformanceConfig {
             max_search_threads: 1,
@@ -55,18 +57,18 @@ fn test_alias_operation() {
             search_timeout_sec: None,
             incoming_shard_transfers_limit: Some(1),
             outgoing_shard_transfers_limit: Some(1),
+            async_scorer: None,
         },
         hnsw_index: Default::default(),
-        quantization: None,
         mmap_advice: madvise::Advice::Random,
         node_type: Default::default(),
         update_queue_size: Default::default(),
         handle_collection_load_errors: false,
         recovery_mode: None,
-        async_scorer: false,
         update_concurrency: Some(NonZeroUsize::new(2).unwrap()),
         // update_concurrency: None,
         shard_transfer_method: None,
+        collection: None,
     };
 
     let search_runtime = Runtime::new().unwrap();
@@ -94,26 +96,31 @@ fn test_alias_operation() {
     handle
         .block_on(
             dispatcher.submit_collection_meta_op(
-                CollectionMetaOperations::CreateCollection(CreateCollectionOperation::new(
-                    "test".to_string(),
-                    CreateCollection {
-                        vectors: VectorParamsBuilder::new(10, Distance::Cosine)
-                            .build()
-                            .into(),
-                        sparse_vectors: None,
-                        hnsw_config: None,
-                        wal_config: None,
-                        optimizers_config: None,
-                        shard_number: Some(1),
-                        on_disk_payload: None,
-                        replication_factor: None,
-                        write_consistency_factor: None,
-                        init_from: None,
-                        quantization_config: None,
-                        sharding_method: None,
-                    },
-                )),
-                FULL_ACCESS.clone(),
+                CollectionMetaOperations::CreateCollection(
+                    CreateCollectionOperation::new(
+                        "test".to_string(),
+                        CreateCollection {
+                            vectors: VectorParamsBuilder::new(10, Distance::Cosine)
+                                .build()
+                                .into(),
+                            sparse_vectors: None,
+                            hnsw_config: None,
+                            wal_config: None,
+                            optimizers_config: None,
+                            shard_number: Some(1),
+                            on_disk_payload: None,
+                            replication_factor: None,
+                            write_consistency_factor: None,
+                            init_from: None,
+                            quantization_config: None,
+                            sharding_method: None,
+                            strict_mode_config: None,
+                            uuid: None,
+                        },
+                    )
+                    .unwrap(),
+                ),
+                FULL_ACCESS,
                 None,
             ),
         )
@@ -128,7 +135,7 @@ fn test_alias_operation() {
                     }
                     .into()],
             }),
-            FULL_ACCESS.clone(),
+            FULL_ACCESS,
             None,
         ))
         .unwrap();
@@ -153,14 +160,17 @@ fn test_alias_operation() {
                         .into(),
                     ],
             }),
-            FULL_ACCESS.clone(),
+            FULL_ACCESS,
             None,
         ))
         .unwrap();
 
+    // Nothing to verify here.
+    let pass = new_unchecked_verification_pass();
+
     let _ = handle
         .block_on(
-            dispatcher.toc(&FULL_ACCESS).get_collection(
+            dispatcher.toc(&FULL_ACCESS, &pass).get_collection(
                 &FULL_ACCESS
                     .check_collection_access("test_alias3", AccessRequirements::new())
                     .unwrap(),

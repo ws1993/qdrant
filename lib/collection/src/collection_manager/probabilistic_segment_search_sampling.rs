@@ -6,6 +6,8 @@
 ///
 /// TODO attach proper python code to generate the table
 /// Python code to generate the table:
+///
+/// ```python
 /// from scipy.stats import poisson
 /// q = 0.999 # probability to cover full top in all segments
 /// res = []
@@ -15,6 +17,7 @@
 ///     k = poisson.ppf(q**(1/s), lmbda)
 ///     res.append((lmbda, int(k)))
 /// res = sorted(res, key=lambda x: x[0])
+/// ```
 ///
 /// with additional code to remove duplicates and values within 5% of each other.
 const POISSON_DISTRIBUTION_SEARCH_SAMPLING: [(f64, usize); 121] = [
@@ -142,12 +145,12 @@ const POISSON_DISTRIBUTION_SEARCH_SAMPLING: [(f64, usize); 121] = [
 ];
 
 /// Uses binary search to find the sampling size for a given lambda.
-pub fn find_search_sampling_over_point_distribution(n: f64, p: f64) -> Option<usize> {
+pub fn find_search_sampling_over_point_distribution(n: f64, p: f64) -> usize {
     let target_lambda = p * n;
     let k = POISSON_DISTRIBUTION_SEARCH_SAMPLING
         .binary_search_by(|&(lambda, _sampling)| lambda.partial_cmp(&target_lambda).unwrap());
     match k {
-        Ok(k) => Some(POISSON_DISTRIBUTION_SEARCH_SAMPLING[k].1),
-        Err(insert) => Some(POISSON_DISTRIBUTION_SEARCH_SAMPLING[insert].1),
+        Ok(k) => POISSON_DISTRIBUTION_SEARCH_SAMPLING[k].1,
+        Err(insert) => POISSON_DISTRIBUTION_SEARCH_SAMPLING[insert].1,
     }
 }

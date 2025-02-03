@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::Future;
 use itertools::Itertools;
 use tokio::sync::RwLockReadGuard;
@@ -25,6 +26,7 @@ where
     read_consistency: Option<ReadConsistency>,
     shard_selection: ShardSelectorInternal,
     timeout: Option<Duration>,
+    hw_measurement_acc: HwMeasurementAcc,
 }
 
 impl<'a, F, Fut> GroupBy<'a, F, Fut>
@@ -33,7 +35,12 @@ where
     Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
 {
     /// Creates a basic GroupBy builder
-    pub fn new(group_by: GroupRequest, collection: &'a Collection, collection_by_name: F) -> Self {
+    pub fn new(
+        group_by: GroupRequest,
+        collection: &'a Collection,
+        collection_by_name: F,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> Self {
         Self {
             group_by,
             collection,
@@ -41,6 +48,7 @@ where
             read_consistency: None,
             shard_selection: ShardSelectorInternal::All,
             timeout: None,
+            hw_measurement_acc,
         }
     }
 
@@ -75,15 +83,18 @@ where
 
     /// Does the actual grouping
     async fn run(self) -> CollectionResult<Vec<PointGroup>> {
+        let start = std::time::Instant::now();
         let with_lookup = self.group_by.with_lookup.clone();
 
         let core_group_by = self
             .group_by
-            .into_core_group_request(
+            .into_query_group_request(
                 self.collection,
                 self.collection_by_name.clone(),
                 self.read_consistency,
                 self.shard_selection.clone(),
+                self.timeout,
+                self.hw_measurement_acc.clone(),
             )
             .await?;
 
@@ -93,10 +104,15 @@ where
             self.read_consistency,
             self.shard_selection.clone(),
             self.timeout,
+            self.hw_measurement_acc.clone(),
         )
         .await?;
 
         if let Some(lookup) = with_lookup {
+            // update timeout
+            let timeout = self
+                .timeout
+                .map(|timeout| timeout.saturating_sub(start.elapsed()));
             let mut lookups = {
                 let pseudo_ids = groups
                     .iter()
@@ -110,6 +126,8 @@ where
                     self.collection_by_name,
                     self.read_consistency,
                     &self.shard_selection,
+                    timeout,
+                    self.hw_measurement_acc.clone(),
                 )
                 .await?
             };

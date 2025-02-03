@@ -1,20 +1,15 @@
 use std::cmp::max;
 use std::collections::TryReserveError;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::mem;
 use std::path::Path;
 
-use common::types::PointOffsetType;
-
 use crate::common::vector_utils::{TrySetCapacity, TrySetCapacityExact};
+use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
+use crate::vector_storage::common::CHUNK_SIZE;
 
-// chunk size in bytes
-const CHUNK_SIZE: usize = 32 * 1024 * 1024;
-
-// if dimension is too high, use this capacity
-const MIN_CHUNK_CAPACITY: usize = 16;
-
+#[derive(Debug)]
 pub struct ChunkedVectors<T> {
     /// Vector's dimension.
     ///
@@ -31,7 +26,8 @@ impl<T: Copy + Clone + Default> ChunkedVectors<T> {
     pub fn new(dim: usize) -> Self {
         assert_ne!(dim, 0, "The vector's dimension cannot be 0");
         let vector_size = dim * mem::size_of::<T>();
-        let chunk_capacity = max(MIN_CHUNK_CAPACITY, CHUNK_SIZE / vector_size);
+        let chunk_capacity = CHUNK_SIZE / vector_size;
+        assert_ne!(chunk_capacity, 0, "The vector's size is too big");
         Self {
             dim,
             len: 0,
@@ -48,58 +44,58 @@ impl<T: Copy + Clone + Default> ChunkedVectors<T> {
         self.len == 0
     }
 
-    pub fn get<TKey>(&self, key: TKey) -> &[T]
-    where
-        TKey: num_traits::cast::AsPrimitive<usize>,
-    {
-        let key: usize = key.as_();
-        let chunk_data = &self.chunks[key / self.chunk_capacity];
-        let idx = (key % self.chunk_capacity) * self.dim;
-        &chunk_data[idx..idx + self.dim]
+    pub fn get(&self, key: VectorOffsetType) -> &[T] {
+        self.get_opt(key).expect("vector not found")
     }
 
-    pub fn get_many<TKey>(&self, key: TKey, count: usize) -> &[T]
-    where
-        TKey: num_traits::cast::AsPrimitive<usize>,
-    {
-        let key: usize = key.as_();
-        let chunk_data = &self.chunks[key / self.chunk_capacity];
-        let idx = (key % self.chunk_capacity) * self.dim;
-        &chunk_data[idx..idx + count * self.dim]
+    pub fn get_opt(&self, key: VectorOffsetType) -> Option<&[T]> {
+        if self.chunks.is_empty() {
+            return None;
+        }
+        self.chunks
+            .get(key / self.chunk_capacity)
+            .and_then(|chunk_data| {
+                let idx = (key % self.chunk_capacity) * self.dim;
+                let range = idx..idx + self.dim;
+                chunk_data.get(range)
+            })
     }
 
-    pub fn push(&mut self, vector: &[T]) -> Result<PointOffsetType, TryReserveError> {
-        let new_id = self.len as PointOffsetType;
+    pub fn get_many(&self, key: VectorOffsetType, count: usize) -> Option<&[T]> {
+        if self.chunks.is_empty() {
+            return None;
+        }
+        self.chunks
+            .get(key / self.chunk_capacity)
+            .and_then(|chunk_data| {
+                let idx = (key % self.chunk_capacity) * self.dim;
+                let range = idx..idx + count * self.dim;
+                chunk_data.get(range)
+            })
+    }
+
+    pub fn push(&mut self, vector: &[T]) -> Result<VectorOffsetType, TryReserveError> {
+        let new_id = self.len;
         self.insert(new_id, vector)?;
         Ok(new_id)
     }
 
     // returns how many flattened vectors can be inserted starting from key
-    pub fn get_chunk_left_keys<TKey>(&mut self, start_key: TKey) -> usize
-    where
-        TKey: num_traits::cast::AsPrimitive<usize>,
-    {
-        self.chunk_capacity - (start_key.as_() % self.chunk_capacity)
+    pub fn get_chunk_left_keys(&self, start_key: VectorOffsetType) -> usize {
+        self.chunk_capacity - (start_key % self.chunk_capacity)
     }
 
-    pub fn insert<TKey>(&mut self, key: TKey, vector: &[T]) -> Result<(), TryReserveError>
-    where
-        TKey: num_traits::cast::AsPrimitive<usize>,
-    {
+    pub fn insert(&mut self, key: VectorOffsetType, vector: &[T]) -> Result<(), TryReserveError> {
         assert_eq!(vector.len(), self.dim, "Vector size mismatch");
         self.insert_many(key, vector, 1)
     }
 
-    pub fn insert_many<TKey>(
+    pub fn insert_many(
         &mut self,
-        key: TKey,
+        key: VectorOffsetType,
         vectors: &[T],
         vectors_count: usize,
-    ) -> Result<(), TryReserveError>
-    where
-        TKey: num_traits::cast::AsPrimitive<usize>,
-    {
-        let key = key.as_();
+    ) -> Result<(), TryReserveError> {
         assert_eq!(
             vectors.len(),
             vectors_count * self.dim,
@@ -192,9 +188,10 @@ impl quantization::EncodedStorage for ChunkedVectors<u8> {
                     format!("Failed to load quantized vectors from file: {err}"),
                 )
             })?;
-        let mut file = File::open(path)?;
+        let file = File::open(path)?;
+        let mut reader = BufReader::new(file);
         let mut buffer = vec![0u8; quantized_vector_size];
-        while file.read_exact(&mut buffer).is_ok() {
+        while reader.read_exact(&mut buffer).is_ok() {
             vectors.push(&buffer).map_err(|err| {
                 std::io::Error::new(
                     std::io::ErrorKind::OutOfMemory,
@@ -220,7 +217,7 @@ impl quantization::EncodedStorage for ChunkedVectors<u8> {
         for i in 0..self.len() {
             buffer.write_all(self.get(i))?;
         }
-        buffer.flush()?;
+        buffer.sync_all()?;
         Ok(())
     }
 }
@@ -263,12 +260,16 @@ mod tests {
     #[test]
     fn test_chunked_vectors_with_skipped_chunks() {
         let mut vectors = ChunkedVectors::new(3);
+        assert_eq!(vectors.get_opt(0), None);
+
         vectors.insert(0, &[1, 2, 3]).unwrap();
         vectors.insert(10_000_000, &[4, 5, 6]).unwrap();
         assert!(vectors.chunks.len() > 3);
 
         assert_eq!(vectors.get(0), &[1, 2, 3]);
         assert_eq!(vectors.get(10_000_000), &[4, 5, 6]);
+
+        assert_eq!(vectors.get_opt(10_000_001), None);
 
         // check if first chunk is fully allocated
         assert_eq!(vectors.get(100), &[0, 0, 0]);

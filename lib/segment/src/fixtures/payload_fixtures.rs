@@ -8,7 +8,8 @@ use rand::seq::SliceRandom;
 use rand::Rng;
 use serde_json::{json, Value};
 
-use crate::data_types::vectors::{DenseVector, MultiDenseVector, VectorElementType};
+use crate::data_types::vectors::{DenseVector, MultiDenseVectorInternal, VectorElementType};
+use crate::payload_json;
 use crate::types::{
     AnyVariants, Condition, ExtendedPointId, FieldCondition, Filter, HasIdCondition,
     IsEmptyCondition, Match, MatchAny, Payload, PayloadField, Range as RangeCondition, ValuesCount,
@@ -60,7 +61,7 @@ pub const TEXT_KEY: &str = "text";
 pub const BOOL_KEY: &str = "bool";
 
 pub fn random_adj<R: Rng + ?Sized>(rnd_gen: &mut R) -> String {
-    ADJECTIVE.choose(rnd_gen).unwrap().to_string()
+    ADJECTIVE.choose(rnd_gen).copied().unwrap().to_string()
 }
 
 pub fn random_keyword<R: Rng + ?Sized>(rnd_gen: &mut R) -> String {
@@ -135,13 +136,13 @@ pub fn random_multi_vector<R: Rng + ?Sized>(
     rnd_gen: &mut R,
     vector_size: usize,
     num_vector_per_points: usize,
-) -> MultiDenseVector {
+) -> MultiDenseVectorInternal {
     let mut vectors = vec![];
     for _ in 0..num_vector_per_points {
         let vec = random_vector(rnd_gen, vector_size);
         vectors.extend(vec);
     }
-    MultiDenseVector::new(vectors, vector_size)
+    MultiDenseVectorInternal::new(vectors, vector_size)
 }
 
 pub fn random_uncommon_condition<R: Rng + ?Sized>(rnd_gen: &mut R) -> Condition {
@@ -250,7 +251,7 @@ pub fn random_match_any_filter<R: Rng + ?Sized>(
         must: Some(vec![Condition::Field(FieldCondition::new_match(
             STR_KEY.parse().unwrap(),
             Match::Any(MatchAny {
-                any: AnyVariants::Keywords(values),
+                any: AnyVariants::Strings(values),
             }),
         ))]),
         must_not: None,
@@ -304,9 +305,9 @@ pub fn random_nested_filter<R: Rng + ?Sized>(rnd_gen: &mut R) -> Filter {
     Filter::new_should(condition)
 }
 
-fn random_json<R: Rng + ?Sized>(rnd_gen: &mut R) -> Value {
+pub fn generate_diverse_payload<R: Rng + ?Sized>(rnd_gen: &mut R) -> Payload {
     if rnd_gen.gen_range(0.0..1.0) < 0.5 {
-        json!({
+        payload_json! {
             STR_KEY: random_keyword_payload(rnd_gen, 1..=3),
             INT_KEY: random_int_payload(rnd_gen, 1..=3),
             INT_KEY_2: random_int_payload(rnd_gen, 1..=2),
@@ -315,9 +316,9 @@ fn random_json<R: Rng + ?Sized>(rnd_gen: &mut R) -> Value {
             GEO_KEY: random_geo_payload(rnd_gen, 1..=3),
             TEXT_KEY: random_keyword_payload(rnd_gen, 1..=1),
             BOOL_KEY: random_bool_payload(rnd_gen, 1..=1),
-        })
+        }
     } else {
-        json!({
+        payload_json! {
             STR_KEY: random_keyword_payload(rnd_gen, 1..=2),
             INT_KEY: random_int_payload(rnd_gen, 1..=3),
             INT_KEY_2: random_int_payload(rnd_gen, 1..=2),
@@ -327,16 +328,12 @@ fn random_json<R: Rng + ?Sized>(rnd_gen: &mut R) -> Value {
             TEXT_KEY: random_keyword_payload(rnd_gen, 1..=1),
             BOOL_KEY: random_bool_payload(rnd_gen, 1..=2),
             FLICKING_KEY: random_int_payload(rnd_gen, 1..=3)
-        })
+        }
     }
 }
 
-pub fn generate_diverse_payload<R: Rng + ?Sized>(rnd_gen: &mut R) -> Payload {
-    random_json(rnd_gen).into()
-}
-
 pub fn generate_diverse_nested_payload<R: Rng + ?Sized>(rnd_gen: &mut R) -> Payload {
-    json!({
+    payload_json! {
         STR_KEY: {
             "nested_1": {
                 "nested_2": random_keyword_payload(rnd_gen, 1..=3)
@@ -354,32 +351,5 @@ pub fn generate_diverse_nested_payload<R: Rng + ?Sized>(rnd_gen: &mut R) -> Payl
                 ]
             }
         ],
-    })
-    .into()
-}
-
-pub const NESTED_ARRAY_1: &str = "arr1";
-pub const NESTED_ARRAY_2: &str = "arr2";
-pub const NESTED_ARRAY_3: &str = "arr3";
-
-pub fn generate_nested_array_payload<R: Rng + ?Sized>(rnd_gen: &mut R) -> Payload {
-    json!({
-        NESTED_ARRAY_1: [
-            random_json(rnd_gen),
-            random_json(rnd_gen),
-            random_json(rnd_gen),
-            random_json(rnd_gen),
-        ],
-        NESTED_ARRAY_2: [
-            {
-                   NESTED_ARRAY_3: [
-                       random_json(rnd_gen),
-                       random_json(rnd_gen),
-                       random_json(rnd_gen),
-                       random_json(rnd_gen),
-                   ]
-            }
-        ]
-    })
-    .into()
+    }
 }

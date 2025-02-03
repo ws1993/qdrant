@@ -2,17 +2,22 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::mem::take;
 
+use api::rest::LookupLocation;
+use collection::collection::distance_matrix::CollectionSearchMatrixRequest;
 use collection::grouping::group_by::{GroupRequest, SourceRequest};
 use collection::lookup::WithLookup;
 use collection::operations::payload_ops::{DeletePayloadOp, PayloadOps, SetPayloadOp};
 use collection::operations::point_ops::{PointIdsList, PointOperations};
 use collection::operations::types::{
     ContextExamplePair, CoreSearchRequest, CountRequestInternal, DiscoverRequestInternal,
-    LookupLocation, PointRequestInternal, RecommendExample, RecommendRequestInternal,
-    ScrollRequestInternal,
+    PointRequestInternal, RecommendExample, RecommendRequestInternal, ScrollRequestInternal,
+};
+use collection::operations::universal_query::collection_query::{
+    CollectionPrefetch, CollectionQueryRequest, Query, VectorInputInternal, VectorQuery,
 };
 use collection::operations::vector_ops::VectorOperations;
 use collection::operations::CollectionUpdateOperations;
+use segment::data_types::facets::FacetParams;
 use segment::types::{Condition, ExtendedPointId, FieldCondition, Filter, Match, Payload};
 
 use super::{
@@ -20,7 +25,7 @@ use super::{
     CollectionAccessView, CollectionPass, PayloadConstraint,
 };
 use crate::content_manager::collection_meta_ops::CollectionMetaOperations;
-use crate::content_manager::errors::StorageError;
+use crate::content_manager::errors::{StorageError, StorageResult};
 
 impl Access {
     #[allow(private_bounds)]
@@ -50,6 +55,7 @@ impl Access {
             | CollectionMetaOperations::UpdateCollection(_)
             | CollectionMetaOperations::DeleteCollection(_)
             | CollectionMetaOperations::ChangeAliases(_)
+            | CollectionMetaOperations::Resharding(_, _)
             | CollectionMetaOperations::TransferShard(_, _)
             | CollectionMetaOperations::SetShardReplicaState(_)
             | CollectionMetaOperations::CreateShardKey(_)
@@ -59,13 +65,13 @@ impl Access {
             CollectionMetaOperations::CreatePayloadIndex(op) => {
                 self.check_collection_access(
                     &op.collection_name,
-                    AccessRequirements::new().write().whole(),
+                    AccessRequirements::new().write().whole().extras(),
                 )?;
             }
             CollectionMetaOperations::DropPayloadIndex(op) => {
                 self.check_collection_access(
                     &op.collection_name,
-                    AccessRequirements::new().write().whole(),
+                    AccessRequirements::new().write().whole().extras(),
                 )?;
             }
             CollectionMetaOperations::Nop { token: _ } => (),
@@ -106,7 +112,7 @@ impl CollectionAccessList {
     }
 }
 
-impl<'a> CollectionAccessView<'a> {
+impl CollectionAccessView<'_> {
     fn apply_filter(&self, filter: &mut Option<Filter>) {
         if let Some(payload) = &self.payload {
             let f = filter.get_or_insert_with(Default::default);
@@ -120,6 +126,39 @@ impl<'a> CollectionAccessView<'a> {
             RecommendExample::Dense(_) | RecommendExample::Sparse(_) => Ok(()),
         }
     }
+
+    fn check_vector_query(
+        &self,
+        vector_query: &VectorQuery<VectorInputInternal>,
+    ) -> Result<(), StorageError> {
+        match vector_query {
+            VectorQuery::Nearest(nearest) => self.check_vector_input(nearest)?,
+            VectorQuery::RecommendBestScore(reco) | VectorQuery::RecommendAverageVector(reco) => {
+                for vector_input in reco.flat_iter() {
+                    self.check_vector_input(vector_input)?
+                }
+            }
+            VectorQuery::Discover(discover) => {
+                for vector_input in discover.flat_iter() {
+                    self.check_vector_input(vector_input)?
+                }
+            }
+            VectorQuery::Context(context) => {
+                for vector_input in context.flat_iter() {
+                    self.check_vector_input(vector_input)?
+                }
+            }
+        };
+
+        Ok(())
+    }
+
+    fn check_vector_input(&self, vector_input: &VectorInputInternal) -> Result<(), StorageError> {
+        match vector_input {
+            VectorInputInternal::Vector(_) => Ok(()),
+            VectorInputInternal::Id(_) => self.check_whole_access(),
+        }
+    }
 }
 
 impl CheckableCollectionOperation for RecommendRequestInternal {
@@ -128,6 +167,7 @@ impl CheckableCollectionOperation for RecommendRequestInternal {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -154,6 +194,7 @@ impl CheckableCollectionOperation for PointRequestInternal {
             write: false,
             manage: false,
             whole: true,
+            extras: false,
         }
     }
 
@@ -172,6 +213,7 @@ impl CheckableCollectionOperation for CoreSearchRequest {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -191,6 +233,7 @@ impl CheckableCollectionOperation for CountRequestInternal {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -210,6 +253,7 @@ impl CheckableCollectionOperation for GroupRequest {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -223,6 +267,7 @@ impl CheckableCollectionOperation for GroupRequest {
                 view.apply_filter(&mut s.filter);
             }
             SourceRequest::Recommend(r) => r.check_access(view, access)?,
+            SourceRequest::Query(q) => q.check_access(view, access)?,
         }
         access.check_with_lookup(&self.with_lookup)?;
         Ok(())
@@ -235,6 +280,7 @@ impl CheckableCollectionOperation for DiscoverRequestInternal {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -263,6 +309,7 @@ impl CheckableCollectionOperation for ScrollRequestInternal {
             write: false,
             manage: false,
             whole: false,
+            extras: false,
         }
     }
 
@@ -271,6 +318,98 @@ impl CheckableCollectionOperation for ScrollRequestInternal {
         view: CollectionAccessView<'_>,
         _access: &CollectionAccessList,
     ) -> Result<(), StorageError> {
+        view.apply_filter(&mut self.filter);
+        Ok(())
+    }
+}
+
+impl CheckableCollectionOperation for CollectionQueryRequest {
+    fn access_requirements(&self) -> AccessRequirements {
+        AccessRequirements {
+            write: false,
+            manage: false,
+            whole: false,
+            extras: false,
+        }
+    }
+
+    fn check_access(
+        &mut self,
+        view: CollectionAccessView<'_>,
+        access: &CollectionAccessList,
+    ) -> Result<(), StorageError> {
+        view.apply_filter(&mut self.filter);
+
+        if let Some(Query::Vector(vector_query)) = &self.query {
+            view.check_vector_query(vector_query)?
+        }
+
+        access.check_lookup_from(&self.lookup_from)?;
+
+        for prefetch_query in self.prefetch.iter_mut() {
+            check_access_for_prefetch(prefetch_query, &view, access)?;
+        }
+
+        Ok(())
+    }
+}
+
+fn check_access_for_prefetch(
+    prefetch: &mut CollectionPrefetch,
+    view: &CollectionAccessView<'_>,
+    access: &CollectionAccessList,
+) -> Result<(), StorageError> {
+    view.apply_filter(&mut prefetch.filter);
+
+    if let Some(Query::Vector(vector_query)) = &prefetch.query {
+        view.check_vector_query(vector_query)?
+    }
+
+    access.check_lookup_from(&prefetch.lookup_from)?;
+
+    // Recurse inner prefetches
+    for prefetch_query in prefetch.prefetch.iter_mut() {
+        check_access_for_prefetch(prefetch_query, view, access)?;
+    }
+
+    Ok(())
+}
+
+impl CheckableCollectionOperation for FacetParams {
+    fn access_requirements(&self) -> AccessRequirements {
+        AccessRequirements {
+            write: false,
+            manage: false,
+            whole: false,
+            extras: false,
+        }
+    }
+
+    fn check_access(
+        &mut self,
+        view: CollectionAccessView<'_>,
+        _access: &CollectionAccessList,
+    ) -> StorageResult<()> {
+        view.apply_filter(&mut self.filter);
+        Ok(())
+    }
+}
+
+impl CheckableCollectionOperation for CollectionSearchMatrixRequest {
+    fn access_requirements(&self) -> AccessRequirements {
+        AccessRequirements {
+            write: false,
+            manage: false,
+            whole: false,
+            extras: false,
+        }
+    }
+
+    fn check_access(
+        &mut self,
+        view: CollectionAccessView<'_>,
+        _access: &CollectionAccessList,
+    ) -> StorageResult<()> {
         view.apply_filter(&mut self.filter);
         Ok(())
     }
@@ -285,11 +424,13 @@ impl CheckableCollectionOperation for CollectionUpdateOperations {
                 write: true,
                 manage: false,
                 whole: false, // Checked in `check_access()`
+                extras: false,
             },
             CollectionUpdateOperations::FieldIndexOperation(_) => AccessRequirements {
                 write: true,
                 manage: true,
                 whole: true,
+                extras: true,
             },
         }
     }
@@ -448,7 +589,7 @@ impl PayloadConstraint {
     }
 
     fn make_payload(&self, collection_name: &str) -> Result<Payload, StorageError> {
-        // TODO: We need to construct a payload, then validate it against the claim
+        let _ = self; // TODO: We need to construct a payload, then validate it against the claim
         incompatible_with_payload_constraint(collection_name) // Reject as not implemented
     }
 }
@@ -524,18 +665,19 @@ mod tests {
 mod tests_ops {
     use std::fmt::Debug;
 
-    use api::rest::{BatchVectorStruct, VectorStruct};
+    use api::rest::{
+        self, LookupLocation, OrderByInterface, RecommendStrategy, SearchRequestInternal,
+    };
     use collection::operations::payload_ops::PayloadOpsDiscriminants;
     use collection::operations::point_ops::{
-        Batch, PointInsertOperationsInternal, PointInsertOperationsInternalDiscriminants,
-        PointOperationsDiscriminants, PointStruct, PointSyncOperation,
+        BatchPersisted, BatchVectorStructPersisted, PointInsertOperationsInternal,
+        PointInsertOperationsInternalDiscriminants, PointOperationsDiscriminants,
+        PointStructPersisted, PointSyncOperation, VectorStructPersisted,
     };
     use collection::operations::query_enum::QueryEnum;
-    use collection::operations::types::{
-        OrderByInterface, RecommendStrategy, SearchRequestInternal, UsingVector,
-    };
+    use collection::operations::types::UsingVector;
     use collection::operations::vector_ops::{
-        PointVectors, UpdateVectorsOp, VectorOperationsDiscriminants,
+        PointVectorsPersisted, UpdateVectorsOp, VectorOperationsDiscriminants,
     };
     use collection::operations::{
         CollectionUpdateOperationsDiscriminants, CreateIndex, FieldIndexOperations,
@@ -625,10 +767,10 @@ mod tests_ops {
             with_payload: Some(WithPayloadInterface::Bool(true)),
             with_vector: Some(WithVector::Bool(true)),
             score_threshold: Some(42.0),
-            using: Some(UsingVector::Name("vector".to_string())),
+            using: Some(UsingVector::Name("vector".into())),
             lookup_from: Some(LookupLocation {
                 collection: "col2".to_string(),
-                vector: Some("vector".to_string()),
+                vector: Some("vector".into()),
                 shard_key: None,
             }),
         };
@@ -678,7 +820,7 @@ mod tests_ops {
         assert_allowed(
             &RecommendRequestInternal {
                 lookup_from: None,
-                ..op.clone()
+                ..op
             },
             &AccessCollectionBuilder::new()
                 .add("col", false, true)
@@ -779,7 +921,7 @@ mod tests_ops {
         let op = GroupRequest {
             // NOTE: SourceRequest::Recommend is already tested in test_recommend_request_internal
             source: SourceRequest::Search(SearchRequestInternal {
-                vector: NamedVectorStruct::Default(vec![0.0, 1.0, 2.0]).into(),
+                vector: rest::NamedVectorStruct::Default(vec![0.0, 1.0, 2.0]),
                 filter: None,
                 params: Some(SearchParams::default()),
                 limit: 100,
@@ -845,6 +987,7 @@ mod tests_ops {
                     s.filter = Some(PayloadConstraint::new_test("col").to_filter());
                 }
                 SourceRequest::Recommend(_) => unreachable!(),
+                SourceRequest::Query(_) => unreachable!(),
             },
         );
     }
@@ -863,10 +1006,10 @@ mod tests_ops {
             offset: Some(100),
             with_payload: Some(WithPayloadInterface::Bool(true)),
             with_vector: Some(WithVector::Bool(true)),
-            using: Some(UsingVector::Name("vector".to_string())),
+            using: Some(UsingVector::Name("vector".into())),
             lookup_from: Some(LookupLocation {
                 collection: "col2".to_string(),
-                vector: Some("vector".to_string()),
+                vector: Some("vector".into()),
                 shard_key: None,
             }),
         };
@@ -941,7 +1084,7 @@ mod tests_ops {
         assert_allowed(
             &DiscoverRequestInternal {
                 lookup_from: None,
-                ..op.clone()
+                ..op
             },
             &AccessCollectionBuilder::new()
                 .add("col", false, true)
@@ -971,7 +1114,7 @@ mod tests_ops {
         );
 
         assert_allowed_rewrite(
-            &ScrollRequestInternal { ..op.clone() },
+            &ScrollRequestInternal { ..op },
             &AccessCollectionBuilder::new()
                 .add("col", false, false)
                 .into(),
@@ -1006,16 +1149,18 @@ mod tests_ops {
                 for discr in PointInsertOperationsInternalDiscriminants::iter() {
                     let inner = match discr {
                         PointInsertOperationsInternalDiscriminants::PointsBatch => {
-                            PointInsertOperationsInternal::PointsBatch(Batch {
+                            PointInsertOperationsInternal::PointsBatch(BatchPersisted {
                                 ids: vec![ExtendedPointId::NumId(12345)],
-                                vectors: BatchVectorStruct::Single(vec![vec![0.0, 1.0, 2.0]]),
+                                vectors: BatchVectorStructPersisted::Single(vec![vec![
+                                    0.0, 1.0, 2.0,
+                                ]]),
                                 payloads: None,
                             })
                         }
                         PointInsertOperationsInternalDiscriminants::PointsList => {
-                            PointInsertOperationsInternal::PointsList(vec![PointStruct {
+                            PointInsertOperationsInternal::PointsList(vec![PointStructPersisted {
                                 id: ExtendedPointId::NumId(12345),
-                                vector: VectorStruct::Single(vec![0.0, 1.0, 2.0]),
+                                vector: VectorStructPersisted::Single(vec![0.0, 1.0, 2.0]),
                                 payload: None,
                             }])
                         }
@@ -1097,9 +1242,9 @@ mod tests_ops {
             VectorOperationsDiscriminants::UpdateVectors => {
                 let op = CollectionUpdateOperations::VectorOperation(
                     VectorOperations::UpdateVectors(UpdateVectorsOp {
-                        points: vec![PointVectors {
+                        points: vec![PointVectorsPersisted {
                             id: ExtendedPointId::NumId(12345),
-                            vector: VectorStruct::Single(vec![0.0, 1.0, 2.0]),
+                            vector: VectorStructPersisted::Single(vec![0.0, 1.0, 2.0]),
                         }],
                     }),
                 );
@@ -1112,7 +1257,7 @@ mod tests_ops {
                             points: vec![ExtendedPointId::NumId(12345)],
                             shard_key: None,
                         },
-                        vec!["vector".to_string()],
+                        vec!["vector".into()],
                     ));
                 check_collection_update_operations_delete_vectors(&op);
             }
@@ -1120,7 +1265,7 @@ mod tests_ops {
                 let op = CollectionUpdateOperations::VectorOperation(
                     VectorOperations::DeleteVectorsByFilter(
                         make_filter_from_ids(vec![ExtendedPointId::NumId(12345)]),
-                        vec!["vector".to_string()],
+                        vec!["vector".into()],
                     ),
                 );
                 check_collection_update_operations_delete_vectors(&op);
@@ -1155,7 +1300,7 @@ mod tests_ops {
                     VectorOperations::DeleteVectorsByFilter(
                         make_filter_from_ids(vec![ExtendedPointId::NumId(12345)])
                             .merge_owned(PayloadConstraint::new_test("col").to_filter()),
-                        vec!["vector".to_string()],
+                        vec!["vector".into()],
                     ),
                 );
             },

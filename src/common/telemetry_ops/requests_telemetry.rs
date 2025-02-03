@@ -9,6 +9,7 @@ use segment::common::operation_time_statistics::{
     OperationDurationStatistics, OperationDurationsAggregator, ScopeDurationMeasurer,
 };
 use serde::Serialize;
+use storage::rbac::{Access, AccessRequirements};
 
 pub type HttpStatusCode = u16;
 
@@ -58,7 +59,6 @@ impl ActixTelemetryCollector {
 }
 
 impl TonicTelemetryCollector {
-    #[allow(dead_code)]
     pub fn create_grpc_telemetry_collector(&mut self) -> Arc<Mutex<TonicWorkerTelemetryCollector>> {
         let worker: Arc<Mutex<_>> = Default::default();
         self.workers.push(worker.clone());
@@ -76,7 +76,6 @@ impl TonicTelemetryCollector {
 }
 
 impl TonicWorkerTelemetryCollector {
-    #[allow(dead_code)]
     pub fn add_response(&mut self, method: String, instant: std::time::Instant) {
         let aggregator = self
             .methods
@@ -152,13 +151,19 @@ pub struct RequestsTelemetry {
 
 impl RequestsTelemetry {
     pub fn collect(
+        access: &Access,
         actix_collector: &ActixTelemetryCollector,
         tonic_collector: &TonicTelemetryCollector,
         detail: TelemetryDetail,
-    ) -> Self {
-        let rest = actix_collector.get_telemetry_data(detail);
-        let grpc = tonic_collector.get_telemetry_data(detail);
-        Self { rest, grpc }
+    ) -> Option<Self> {
+        let global_access = AccessRequirements::new().whole();
+        if access.check_global_access(global_access).is_ok() {
+            let rest = actix_collector.get_telemetry_data(detail);
+            let grpc = tonic_collector.get_telemetry_data(detail);
+            Some(Self { rest, grpc })
+        } else {
+            None
+        }
     }
 }
 

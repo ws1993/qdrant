@@ -3,56 +3,73 @@ use std::future::Future;
 
 use actix_web::rt::time::Instant;
 use actix_web::{http, HttpResponse, ResponseError};
-use api::grpc::models::{ApiResponse, ApiStatus};
+use api::rest::models::{ApiResponse, ApiStatus, HardwareUsage};
 use collection::operations::types::CollectionError;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use serde::Serialize;
 use storage::content_manager::errors::StorageError;
-use tokio::task::JoinHandle;
+use storage::content_manager::toc::request_hw_counter::RequestHwCounter;
+use storage::dispatcher::Dispatcher;
 
-pub fn accepted_response(timing: Instant) -> HttpResponse {
+pub fn get_request_hardware_counter(
+    dispatcher: &Dispatcher,
+    collection_name: String,
+    report_to_api: bool,
+) -> RequestHwCounter {
+    RequestHwCounter::new(
+        HwMeasurementAcc::new_with_metrics_drain(
+            dispatcher.get_collection_hw_metrics(collection_name),
+        ),
+        report_to_api,
+    )
+}
+
+pub fn accepted_response(timing: Instant, hardware_usage: Option<HardwareUsage>) -> HttpResponse {
     HttpResponse::Accepted().json(ApiResponse::<()> {
         result: None,
         status: ApiStatus::Accepted,
         time: timing.elapsed().as_secs_f64(),
+        usage: hardware_usage,
     })
 }
 
-pub fn process_response<D>(response: Result<D, StorageError>, timing: Instant) -> HttpResponse
+pub fn process_response<T>(
+    response: Result<T, StorageError>,
+    timing: Instant,
+    hardware_usage: Option<HardwareUsage>,
+) -> HttpResponse
 where
-    D: Serialize,
+    T: Serialize,
 {
     match response {
         Ok(res) => HttpResponse::Ok().json(ApiResponse {
             result: Some(res),
             status: ApiStatus::Ok,
             time: timing.elapsed().as_secs_f64(),
+            usage: hardware_usage,
         }),
-        Err(err) => process_response_error(err, timing),
+        Err(err) => process_response_error(err, timing, hardware_usage),
     }
 }
 
-pub fn process_response_error(err: StorageError, timing: Instant) -> HttpResponse {
-    if let StorageError::ServiceError {
-        description,
-        backtrace,
-    } = &err
-    {
-        log::warn!("error processing request: {}", description);
-        if let Some(backtrace) = backtrace {
-            log::trace!("backtrace: {}", backtrace);
-        }
-    }
+pub fn process_response_error(
+    err: StorageError,
+    timing: Instant,
+    hardware_usage: Option<HardwareUsage>,
+) -> HttpResponse {
+    log_service_error(&err);
 
-    let error: HttpError = err.into();
+    let error = HttpError::from(err);
 
     HttpResponse::build(error.status_code()).json(ApiResponse::<()> {
         result: None,
         status: ApiStatus::Error(error.to_string()),
         time: timing.elapsed().as_secs_f64(),
+        usage: hardware_usage,
     })
 }
 
-/// Response wrapper for a ``Future`` returning ``Result``.
+/// Response wrapper for a `Future` returning `Result`.
 ///
 /// # Cancel safety
 ///
@@ -65,57 +82,28 @@ where
     time_impl(async { future.await.map(Some) }).await
 }
 
-/// Response wrapper for a ``Future`` returning ``Result``.
-/// If ``wait`` is false, returns ``202 Accepted`` immediately.
+/// Response wrapper for a `Future` returning `Result`.
+/// If `wait` is false, returns `202 Accepted` immediately.
 pub async fn time_or_accept<T, Fut>(future: Fut, wait: bool) -> HttpResponse
 where
     Fut: Future<Output = Result<T, StorageError>> + Send + 'static,
     T: serde::Serialize + Send + 'static,
 {
     let future = async move {
-        let handle = tokio::task::spawn(future);
+        let handle = tokio::task::spawn(async move {
+            let result = future.await;
+
+            if !wait {
+                if let Err(err) = &result {
+                    log_service_error(err);
+                }
+            }
+
+            result
+        });
 
         if wait {
             handle.await?.map(Some)
-        } else {
-            Ok(None)
-        }
-    };
-
-    time_impl(future).await
-}
-
-/// Response wrapper for a ``Future`` returning ``Result<JoinHandle, _>``.
-/// If ``wait`` is true, the ``JoinHandle`` will be awaited.
-/// Otherwise ``202 Accepted`` will be returned immediately.
-///
-/// Example:
-/// ```
-/// time_or_accept_with_handle(wait, async move {
-///     // This will be run in the foreground unconditionally.
-///     some_async_fn().await?;
-///
-///     // If `wait` is true, the result of this function will be awaited.
-///     // Otherwise, 202 Accepted will be returned immediately.
-///     Ok(tokio::spawn(some_long_running_fn(prepare)))
-/// })
-/// ```
-///
-/// # Cancel safety
-///
-/// Future must be cancel safe.
-pub async fn time_or_accept_with_handle<T, Fut>(wait: bool, future: Fut) -> HttpResponse
-where
-    Fut: Future<Output = Result<JoinHandle<Result<T, StorageError>>, StorageError>>,
-    T: serde::Serialize + Send + 'static,
-{
-    let future = async move {
-        let res = future.await?;
-        if wait {
-            res.await
-                .map_err(Into::<StorageError>::into)
-                .and_then(|x| x)
-                .map(Some)
         } else {
             Ok(None)
         }
@@ -134,12 +122,20 @@ where
 {
     let instant = Instant::now();
     match future.await.transpose() {
-        Some(v) => process_response(v, instant),
-        None => accepted_response(instant),
+        Some(res) => process_response(res, instant, None),
+        None => accepted_response(instant, None),
     }
 }
 
-pub type HttpResult<T, E = HttpError> = Result<T, E>;
+fn log_service_error(err: &StorageError) {
+    if let StorageError::ServiceError { backtrace, .. } = err {
+        log::error!("Error processing request: {err}");
+
+        if let Some(backtrace) = backtrace {
+            log::trace!("Backtrace: {backtrace}");
+        }
+    }
+}
 
 #[derive(Clone, Debug, thiserror::Error)]
 #[error("{0}")]
@@ -158,6 +154,8 @@ impl ResponseError for HttpError {
             StorageError::ChecksumMismatch { .. } => http::StatusCode::BAD_REQUEST,
             StorageError::Forbidden { .. } => http::StatusCode::FORBIDDEN,
             StorageError::PreconditionFailed { .. } => http::StatusCode::INTERNAL_SERVER_ERROR,
+            StorageError::InferenceError { .. } => http::StatusCode::BAD_REQUEST,
+            StorageError::RateLimitExceeded { .. } => http::StatusCode::TOO_MANY_REQUESTS,
         }
     }
 }

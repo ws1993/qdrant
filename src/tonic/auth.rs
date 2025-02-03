@@ -1,14 +1,15 @@
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::future::BoxFuture;
-use storage::content_manager::conversions::error_to_status;
 use storage::rbac::Access;
 use tonic::body::BoxBody;
 use tonic::Status;
 use tower::{Layer, Service};
 
 use crate::common::auth::{AuthError, AuthKeys};
+use crate::common::inference::InferenceToken;
 
 type Request = tonic::codegen::http::Request<tonic::transport::Body>;
 type Response = tonic::codegen::http::Response<BoxBody>;
@@ -19,20 +20,37 @@ pub struct AuthMiddleware<S> {
     service: S,
 }
 
-async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, Status> {
-    let access = auth_keys
-        .validate_request(|key| req.headers().get(key).and_then(|val| val.to_str().ok()))
+async fn check(
+    auth_keys: Arc<AuthKeys>,
+    mut req: Request,
+    hw_measurement_acc: HwMeasurementAcc,
+) -> Result<Request, Status> {
+    let (access, api_key) = auth_keys
+        .validate_request(
+            |key| req.headers().get(key).and_then(|val| val.to_str().ok()),
+            hw_measurement_acc,
+        )
         .await
         .map_err(|e| match e {
             AuthError::Unauthorized(e) => Status::unauthenticated(e),
             AuthError::Forbidden(e) => Status::permission_denied(e),
-            AuthError::StorageError(e) => error_to_status(e),
+            AuthError::StorageError(e) => Status::from(e),
         })?;
 
-    let _previous = req.extensions_mut().insert::<Access>(access);
+    let previous = req.extensions_mut().insert::<Access>(access);
+
     debug_assert!(
-        _previous.is_none(),
+        previous.is_none(),
         "Previous access object should not exist in the request"
+    );
+
+    let previous_token = req
+        .extensions_mut()
+        .insert(InferenceToken::new(api_key.to_string()));
+
+    debug_assert!(
+        previous_token.is_none(),
+        "Previous inference token should not exist in the request"
     );
 
     Ok(req)
@@ -54,8 +72,10 @@ where
     fn call(&mut self, request: Request) -> Self::Future {
         let auth_keys = self.auth_keys.clone();
         let mut service = self.service.clone();
+        let hw_measurement_acc = HwMeasurementAcc::disposable(); // TODO(io_measurement): propagate this value!
+
         Box::pin(async move {
-            match check(auth_keys, request).await {
+            match check(auth_keys, request, hw_measurement_acc).await {
                 Ok(req) => service.call(req).await,
                 Err(e) => Ok(e.to_http()),
             }

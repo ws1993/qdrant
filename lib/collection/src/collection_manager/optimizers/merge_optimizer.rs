@@ -5,7 +5,7 @@ use std::sync::Arc;
 use itertools::Itertools;
 use parking_lot::Mutex;
 use segment::common::operation_time_statistics::OperationDurationsAggregator;
-use segment::types::{HnswConfig, QuantizationConfig, SegmentType, VECTOR_ELEMENT_SIZE};
+use segment::types::{HnswConfig, QuantizationConfig, SegmentType};
 
 use crate::collection_manager::holders::segment_holder::{
     LockedSegment, LockedSegmentHolder, SegmentId,
@@ -18,6 +18,7 @@ use crate::config::CollectionParams;
 const BYTES_IN_KB: usize = 1024;
 
 /// Optimizer that tries to reduce number of segments until it fits configured value.
+///
 /// It merges 3 smallest segments into a single large segment.
 /// Merging 3 segments instead of 2 guarantees that after the optimization the number of segments
 /// will be less than before.
@@ -61,7 +62,7 @@ impl SegmentOptimizer for MergeOptimizer {
         "merge"
     }
 
-    fn collection_path(&self) -> &Path {
+    fn segments_path(&self) -> &Path {
         self.segments_path.as_path()
     }
 
@@ -115,14 +116,9 @@ impl SegmentOptimizer for MergeOptimizer {
                 let read_segment = segment_entry.read();
                 (read_segment.segment_type() != SegmentType::Special).then_some((
                     *idx,
-                    read_segment.available_point_count()
-                        * read_segment
-                            .vector_dims()
-                            .values()
-                            .max()
-                            .copied()
-                            .unwrap_or(0)
-                        * VECTOR_ELEMENT_SIZE,
+                    read_segment
+                        .max_available_vectors_size_in_bytes()
+                        .unwrap_or_default(),
                 ))
             })
             .sorted_by_key(|(_, size)| *size)
@@ -134,7 +130,7 @@ impl SegmentOptimizer for MergeOptimizer {
                 *size
                     < self
                         .thresholds_config
-                        .max_segment_size
+                        .max_segment_size_kb
                         .saturating_mul(BYTES_IN_KB)
             })
             .take(max_candidates)
@@ -144,7 +140,6 @@ impl SegmentOptimizer for MergeOptimizer {
         if candidates.len() < 3 {
             return vec![];
         }
-        log::debug!("Merge candidates: {:?}", candidates);
         candidates
     }
 
@@ -176,25 +171,25 @@ mod tests {
         let dim = 256;
 
         let _segments_to_merge = [
-            holder.add(random_segment(dir.path(), 100, 40, dim)),
-            holder.add(random_segment(dir.path(), 100, 50, dim)),
-            holder.add(random_segment(dir.path(), 100, 60, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 40, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 50, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 60, dim)),
         ];
 
-        let mut merge_optimizer = get_merge_optimizer(dir.path(), temp_dir.path(), dim);
+        let mut merge_optimizer = get_merge_optimizer(dir.path(), temp_dir.path(), dim, None);
 
         let locked_holder = Arc::new(RwLock::new(holder));
 
         merge_optimizer.default_segments_number = 1;
 
-        merge_optimizer.thresholds_config.max_segment_size = 100;
+        merge_optimizer.thresholds_config.max_segment_size_kb = 100;
 
         let check_result_empty =
             merge_optimizer.check_condition(locked_holder.clone(), &Default::default());
 
         assert!(check_result_empty.is_empty());
 
-        merge_optimizer.thresholds_config.max_segment_size = 200;
+        merge_optimizer.thresholds_config.max_segment_size_kb = 200;
 
         let check_result = merge_optimizer.check_condition(locked_holder, &Default::default());
 
@@ -210,19 +205,19 @@ mod tests {
         let dim = 256;
 
         let segments_to_merge = [
-            holder.add(random_segment(dir.path(), 100, 3, dim)),
-            holder.add(random_segment(dir.path(), 100, 3, dim)),
-            holder.add(random_segment(dir.path(), 100, 3, dim)),
-            holder.add(random_segment(dir.path(), 100, 10, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 3, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 3, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 3, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 10, dim)),
         ];
 
         let other_segment_ids = [
-            holder.add(random_segment(dir.path(), 100, 20, dim)),
-            holder.add(random_segment(dir.path(), 100, 20, dim)),
-            holder.add(random_segment(dir.path(), 100, 20, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 20, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 20, dim)),
+            holder.add_new(random_segment(dir.path(), 100, 20, dim)),
         ];
 
-        let merge_optimizer = get_merge_optimizer(dir.path(), temp_dir.path(), dim);
+        let merge_optimizer = get_merge_optimizer(dir.path(), temp_dir.path(), dim, None);
 
         let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
 

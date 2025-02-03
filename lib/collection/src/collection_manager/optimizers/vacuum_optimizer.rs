@@ -65,7 +65,7 @@ impl VacuumOptimizer {
         &self,
         segments: LockedSegmentHolder,
         excluded_ids: &HashSet<SegmentId>,
-    ) -> Option<(SegmentId, LockedSegment)> {
+    ) -> Option<SegmentId> {
         let segments_read_guard = segments.read();
         segments_read_guard
             .iter()
@@ -81,7 +81,7 @@ impl VacuumOptimizer {
                     .map(|ratio| (*idx, ratio))
             })
             .max_by_key(|(_, ratio)| OrderedFloat(*ratio))
-            .map(|(idx, _)| (idx, segments_read_guard.get(idx).unwrap().clone()))
+            .map(|(idx, _)| idx)
     }
 
     /// Calculate littered ratio for segment on point level
@@ -167,7 +167,7 @@ impl SegmentOptimizer for VacuumOptimizer {
         "vacuum"
     }
 
-    fn collection_path(&self) -> &Path {
+    fn segments_path(&self) -> &Path {
         self.segments_path.as_path()
     }
 
@@ -196,10 +196,9 @@ impl SegmentOptimizer for VacuumOptimizer {
         segments: LockedSegmentHolder,
         excluded_ids: &HashSet<SegmentId>,
     ) -> Vec<SegmentId> {
-        match self.worst_segment(segments, excluded_ids) {
-            None => vec![],
-            Some((segment_id, _segment)) => vec![segment_id],
-        }
+        self.worst_segment(segments, excluded_ids)
+            .into_iter()
+            .collect()
     }
 
     fn get_telemetry_counter(&self) -> &Mutex<OperationDurationsAggregator> {
@@ -213,13 +212,15 @@ mod tests {
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
 
+    use common::counter::hardware_counter::HardwareCounterCell;
     use common::cpu::CpuPermit;
     use itertools::Itertools;
     use parking_lot::RwLock;
     use segment::entry::entry_point::SegmentEntry;
     use segment::index::hnsw_index::num_rayon_threads;
-    use segment::types::{Distance, PayloadContainer, PayloadSchemaType};
-    use serde_json::{json, Value};
+    use segment::payload_json;
+    use segment::types::{Distance, PayloadContainer, PayloadSchemaType, VectorName};
+    use serde_json::Value;
     use tempfile::Builder;
 
     use super::*;
@@ -229,14 +230,19 @@ mod tests {
     use crate::operations::types::VectorsConfig;
     use crate::operations::vector_params_builder::VectorParamsBuilder;
 
+    const VECTOR1_NAME: &VectorName = "vector1";
+    const VECTOR2_NAME: &VectorName = "vector2";
+
     #[test]
     fn test_vacuum_conditions() {
         let temp_dir = Builder::new().prefix("segment_temp_dir").tempdir().unwrap();
         let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
         let mut holder = SegmentHolder::default();
-        let segment_id = holder.add(random_segment(dir.path(), 100, 200, 4));
+        let segment_id = holder.add_new(random_segment(dir.path(), 100, 200, 4));
 
         let segment = holder.get(segment_id).unwrap();
+
+        let hw_counter = HardwareCounterCell::new();
 
         let original_segment_path = match segment {
             LockedSegment::Original(s) => s.read().current_path.clone(),
@@ -252,7 +258,11 @@ mod tests {
             .collect_vec();
 
         for &point_id in &segment_points_to_delete {
-            segment.get().write().delete_point(101, point_id).unwrap();
+            segment
+                .get()
+                .write()
+                .delete_point(101, point_id, &hw_counter)
+                .unwrap();
         }
 
         let segment_points_to_assign1 = segment
@@ -275,7 +285,13 @@ mod tests {
             segment
                 .get()
                 .write()
-                .set_payload(102, point_id, &json!({ "color": "red" }).into(), &None)
+                .set_payload(
+                    102,
+                    point_id,
+                    &payload_json! {"color": "red"},
+                    &None,
+                    &hw_counter,
+                )
                 .unwrap();
         }
 
@@ -283,7 +299,13 @@ mod tests {
             segment
                 .get()
                 .write()
-                .set_payload(102, point_id, &json!({"size": 0.42}).into(), &None)
+                .set_payload(
+                    102,
+                    point_id,
+                    &payload_json! {"size": 0.42},
+                    &None,
+                    &hw_counter,
+                )
                 .unwrap();
         }
 
@@ -293,9 +315,9 @@ mod tests {
             0.2,
             50,
             OptimizerThresholds {
-                max_segment_size: 1000000,
-                memmap_threshold: 1000000,
-                indexing_threshold: 1000000,
+                max_segment_size_kb: 1000000,
+                memmap_threshold_kb: 1000000,
+                indexing_threshold_kb: 1000000,
             },
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
@@ -347,7 +369,7 @@ mod tests {
         // Check payload is preserved in optimized segment
         for &point_id in &segment_points_to_assign1 {
             assert!(segment_guard.has_point(point_id));
-            let payload = segment_guard.payload(point_id).unwrap();
+            let payload = segment_guard.payload(point_id, &hw_counter).unwrap();
             let payload_color = payload
                 .get_value(&"color".parse().unwrap())
                 .into_iter()
@@ -384,18 +406,18 @@ mod tests {
         // Collection configuration
         let (point_count, vector1_dim, vector2_dim) = (1000, 10, 20);
         let thresholds_config = OptimizerThresholds {
-            max_segment_size: usize::MAX,
-            memmap_threshold: usize::MAX,
-            indexing_threshold: 10,
+            max_segment_size_kb: usize::MAX,
+            memmap_threshold_kb: usize::MAX,
+            indexing_threshold_kb: 10,
         };
         let collection_params = CollectionParams {
             vectors: VectorsConfig::Multi(BTreeMap::from([
                 (
-                    "vector1".into(),
+                    VECTOR1_NAME.to_owned(),
                     VectorParamsBuilder::new(vector1_dim, Distance::Dot).build(),
                 ),
                 (
-                    "vector2".into(),
+                    VECTOR2_NAME.to_owned(),
                     VectorParamsBuilder::new(vector2_dim, Distance::Dot).build(),
                 ),
             ])),
@@ -423,7 +445,7 @@ mod tests {
             )
             .unwrap();
 
-        let mut segment_id = holder.add(segment);
+        let mut segment_id = holder.add_new(segment);
         let locked_holder: Arc<RwLock<_>> = Arc::new(RwLock::new(holder));
 
         let hnsw_config = HnswConfig {
@@ -441,7 +463,7 @@ mod tests {
         // Optimizers used in test
         let index_optimizer = IndexingOptimizer::new(
             2,
-            thresholds_config.clone(),
+            thresholds_config,
             dir.path().to_owned(),
             temp_dir.path().to_owned(),
             collection_params.clone(),
@@ -468,7 +490,7 @@ mod tests {
                 &false.into(),
             )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
         assert!(
             locked_holder.read().get(segment_id).is_none(),
             "optimized segment should be gone",
@@ -494,6 +516,8 @@ mod tests {
             vacuum_optimizer.check_condition(locked_holder.clone(), &Default::default());
         assert_eq!(suggested_to_optimize.len(), 0);
 
+        let hw_counter = HardwareCounterCell::new();
+
         // Delete some points and vectors
         {
             let holder = locked_holder.write();
@@ -510,13 +534,13 @@ mod tests {
                 .filter_map(|(i, point_id)| (i % 10 == 3).then_some(point_id))
                 .collect_vec();
             for &point_id in &segment_points_to_delete {
-                segment.delete_point(201, point_id).unwrap();
+                segment.delete_point(201, point_id, &hw_counter).unwrap();
             }
 
             // Delete 25% of vectors named vector1
             {
                 let id_tracker = segment.id_tracker.clone();
-                let vector1_data = segment.vector_data.get_mut("vector1").unwrap();
+                let vector1_data = segment.vector_data.get_mut(VECTOR1_NAME).unwrap();
                 let mut vector1_storage = vector1_data.vector_storage.borrow_mut();
 
                 let vector1_vecs_to_delete = id_tracker
@@ -534,7 +558,7 @@ mod tests {
             // Delete 10% of vectors named vector2
             {
                 let id_tracker = segment.id_tracker.clone();
-                let vector2_data = segment.vector_data.get_mut("vector2").unwrap();
+                let vector2_data = segment.vector_data.get_mut(VECTOR2_NAME).unwrap();
                 let mut vector2_storage = vector2_data.vector_storage.borrow_mut();
 
                 let vector2_vecs_to_delete = id_tracker
@@ -583,7 +607,7 @@ mod tests {
                 &false.into(),
             )
             .unwrap();
-        assert!(changed, "optimizer should have rebuilt this segment");
+        assert!(changed > 0, "optimizer should have rebuilt this segment");
 
         // Ensure deleted points and vectors are optimized
         locked_holder

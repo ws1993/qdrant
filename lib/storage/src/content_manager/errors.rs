@@ -6,6 +6,8 @@ use io::file_operations::FileStorageError;
 use tempfile::PersistError;
 use thiserror::Error;
 
+pub type StorageResult<T> = Result<T, StorageError>;
+
 #[derive(Error, Debug, Clone)]
 #[error("{0}")]
 pub enum StorageError {
@@ -32,9 +34,19 @@ pub enum StorageError {
     Forbidden { description: String },
     #[error("Pre-condition failure: {description}")]
     PreconditionFailed { description: String }, // system is not in the state to perform the operation
+    #[error("{description}")]
+    InferenceError { description: String },
+    #[error("Rate limiting exceeded: {description}")]
+    RateLimitExceeded { description: String },
 }
 
 impl StorageError {
+    pub fn inference_error(description: impl Into<String>) -> StorageError {
+        StorageError::InferenceError {
+            description: description.into(),
+        }
+    }
+
     pub fn service_error(description: impl Into<String>) -> StorageError {
         StorageError::ServiceError {
             description: description.into(),
@@ -127,6 +139,17 @@ impl StorageError {
             CollectionError::PreConditionFailed { .. } => StorageError::PreconditionFailed {
                 description: overriding_description,
             },
+            CollectionError::ObjectStoreError { .. } => StorageError::ServiceError {
+                description: overriding_description,
+                backtrace: None,
+            },
+            CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::InferenceError { description } => {
+                StorageError::InferenceError { description }
+            }
+            CollectionError::RateLimitExceeded { description } => {
+                StorageError::RateLimitExceeded { description }
+            }
         }
     }
 }
@@ -171,6 +194,17 @@ impl From<CollectionError> for StorageError {
             CollectionError::PreConditionFailed { .. } => StorageError::PreconditionFailed {
                 description: format!("{err}"),
             },
+            CollectionError::ObjectStoreError { .. } => StorageError::ServiceError {
+                description: format!("{err}"),
+                backtrace: None,
+            },
+            CollectionError::StrictMode { description } => StorageError::Forbidden { description },
+            CollectionError::InferenceError { description } => {
+                StorageError::InferenceError { description }
+            }
+            CollectionError::RateLimitExceeded { description } => {
+                StorageError::RateLimitExceeded { description }
+            }
         }
     }
 }
@@ -251,8 +285,8 @@ impl From<serde_json::Error> for StorageError {
     }
 }
 
-impl From<prost::EncodeError> for StorageError {
-    fn from(err: prost::EncodeError) -> Self {
+impl From<prost_for_raft::EncodeError> for StorageError {
+    fn from(err: prost_for_raft::EncodeError) -> Self {
         StorageError::ServiceError {
             description: format!("prost encode error: {err}"),
             backtrace: Some(Backtrace::force_capture().to_string()),
@@ -260,8 +294,8 @@ impl From<prost::EncodeError> for StorageError {
     }
 }
 
-impl From<prost::DecodeError> for StorageError {
-    fn from(err: prost::DecodeError) -> Self {
+impl From<prost_for_raft::DecodeError> for StorageError {
+    fn from(err: prost_for_raft::DecodeError) -> Self {
         StorageError::ServiceError {
             description: format!("prost decode error: {err}"),
             backtrace: Some(Backtrace::force_capture().to_string()),

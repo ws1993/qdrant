@@ -7,7 +7,7 @@ use itertools::Itertools;
 use super::context_query::ContextPair;
 use super::{Query, TransformInto};
 use crate::common::operation_error::OperationResult;
-use crate::data_types::vectors::{QueryVector, Vector};
+use crate::data_types::vectors::{QueryVector, VectorInternal};
 
 type RankType = i32;
 
@@ -74,8 +74,8 @@ impl<T> Query<T> for DiscoveryQuery<T> {
     }
 }
 
-impl From<DiscoveryQuery<Vector>> for QueryVector {
-    fn from(query: DiscoveryQuery<Vector>) -> Self {
+impl From<DiscoveryQuery<VectorInternal>> for QueryVector {
+    fn from(query: DiscoveryQuery<VectorInternal>) -> Self {
         QueryVector::Discovery(query)
     }
 }
@@ -109,16 +109,15 @@ mod test {
     fn context_ranking(#[case] pairs: Vec<(isize, isize)>, #[case] expected: RankType) {
         let pairs = pairs.into_iter().map(ContextPair::from).collect();
 
-        let _target = 42;
+        let target = 42;
 
-        let query = DiscoveryQuery::new(_target, pairs);
+        let query = DiscoveryQuery::new(target, pairs);
 
         let rank = query.rank_by(dummy_similarity);
 
         assert_eq!(
             rank, expected,
-            "Ranking is incorrect, expected {}, but got {rank}",
-            expected
+            "Ranking is incorrect, expected {expected}, but got {rank}"
         );
     }
 

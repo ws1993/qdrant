@@ -3,11 +3,12 @@ use std::path::Path;
 
 use collection::collection_state;
 use collection::config::ShardingMethod;
+use collection::events::{CollectionDeletedEvent, IndexCreatedEvent};
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::ReplicaState;
 use collection::shards::transfer::ShardTransfer;
 use collection::shards::{transfer, CollectionId};
-use uuid::Uuid;
+use tempfile::Builder;
 
 use super::TableOfContent;
 use crate::content_manager::collection_meta_ops::*;
@@ -38,10 +39,16 @@ impl TableOfContent {
                         .sharding_method
                         .unwrap_or_default()
                     {
-                        ShardingMethod::Auto => CollectionShardDistribution::all_local(
-                            operation.create_collection.shard_number,
-                            self.this_peer_id,
-                        ),
+                        ShardingMethod::Auto => {
+                            let shard_number =
+                                operation.create_collection.shard_number.or_else(|| {
+                                    self.storage_config
+                                        .collection
+                                        .as_ref()
+                                        .map(|i| i.shard_number_per_node)
+                                });
+                            CollectionShardDistribution::all_local(shard_number, self.this_peer_id)
+                        }
                         ShardingMethod::Custom => ShardDistributionProposal::empty().into(),
                     },
                     Some(distribution) => distribution.into(),
@@ -64,6 +71,13 @@ impl TableOfContent {
             CollectionMetaOperations::ChangeAliases(operation) => {
                 log::debug!("Changing aliases");
                 self.update_aliases(operation).await
+            }
+            CollectionMetaOperations::Resharding(collection, operation) => {
+                log::debug!("Resharding {operation:?} of {collection}");
+
+                self.handle_resharding(collection, operation)
+                    .await
+                    .map(|_| true)
             }
             CollectionMetaOperations::TransferShard(collection, operation) => {
                 log::debug!("Transfer shard {:?} of {}", operation, collection);
@@ -112,6 +126,7 @@ impl TableOfContent {
             optimizers_config,
             quantization_config,
             sparse_vectors,
+            strict_mode_config: strict_mode,
         } = operation.update_collection;
         let collection = self
             .get_collection_unchecked(&operation.collection_name)
@@ -147,6 +162,9 @@ impl TableOfContent {
         if let Some(changes) = replica_changes {
             collection.handle_replica_changes(changes).await?;
         }
+        if let Some(strict_mode) = strict_mode {
+            collection.update_strict_mode_config(strict_mode).await?;
+        }
 
         // Recreate optimizers
         if recreate_optimizers {
@@ -167,17 +185,41 @@ impl TableOfContent {
                 .remove_collection(collection_name)?;
 
             let path = self.get_collection_path(collection_name);
+
+            if let Some(state) = removed.resharding_state().await {
+                if let Err(err) = removed.abort_resharding(state.key(), true).await {
+                    log::error!(
+                        "Failed to abort resharding {} when deleting collection {collection_name}: \
+                         {err}",
+                        state.key(),
+                    );
+                }
+            }
+
             drop(removed);
 
             // Move collection to ".deleted" folder to prevent accidental reuse
-            let uuid = Uuid::new_v4().to_string();
+            // the original collection path will be moved atomically within this
+            // directory.
             let removed_collections_path =
                 Path::new(&self.storage_config.storage_path).join(".deleted");
             tokio::fs::create_dir_all(&removed_collections_path).await?;
-            let deleted_path = removed_collections_path
-                .join(collection_name)
-                .with_extension(uuid);
+
+            let deleted_path = Builder::new()
+                // Limit the file name to be on a lower side to avoid running into too-long
+                // file names.
+                // Even if the chosen randomness factor poses chances of collision, the library
+                // prevents creation of duplicate files within the chosen directory.
+                .rand_bytes(8)
+                .prefix("")
+                .tempdir_in(removed_collections_path)?;
+
             tokio::fs::rename(path, &deleted_path).await?;
+
+            // Solve all issues related to this collection
+            issues::publish(CollectionDeletedEvent {
+                collection_id: collection_name.to_string(),
+            });
 
             // At this point collection is removed from memory and moved to ".deleted" folder.
             // Next time we load service the collection will not appear in the list of collections.
@@ -186,7 +228,7 @@ impl TableOfContent {
                 if let Err(error) = tokio::fs::remove_dir_all(&deleted_path).await {
                     log::error!(
                         "Can't delete collection {} from disk. Error: {}",
-                        deleted_path.display(),
+                        deleted_path.as_ref().display(),
                         error
                     );
                 }
@@ -225,12 +267,8 @@ impl TableOfContent {
                             alias_name,
                         },
                 }) => {
-                    collection_lock
-                        .validate_collection_exists(&collection_name)
-                        .await?;
-                    collection_lock
-                        .validate_collection_not_exists(&alias_name)
-                        .await?;
+                    collection_lock.validate_collection_exists(&collection_name)?;
+                    collection_lock.validate_collection_not_exists(&alias_name)?;
 
                     alias_lock.insert(alias_name, collection_name)?;
                 }
@@ -253,16 +291,85 @@ impl TableOfContent {
         Ok(true)
     }
 
+    async fn handle_resharding(
+        &self,
+        collection_id: CollectionId,
+        operation: ReshardingOperation,
+    ) -> Result<(), StorageError> {
+        let collection = self.get_collection_unchecked(&collection_id).await?;
+        let Some(proposal_sender) = self.consensus_proposal_sender.clone() else {
+            return Err(StorageError::service_error(
+                "Can't handle resharding, this is a single node deployment",
+            ));
+        };
+
+        match operation {
+            ReshardingOperation::Start(key) => {
+                let consensus = match self.toc_dispatcher.lock().as_ref() {
+                    Some(consensus) => Box::new(consensus.clone()),
+                    None => {
+                        return Err(StorageError::service_error(
+                            "Can't handle transfer, this is a single node deployment",
+                        ))
+                    }
+                };
+
+                let on_finish = {
+                    let collection_id = collection_id.clone();
+                    let key = key.clone();
+                    let proposal_sender = proposal_sender.clone();
+                    async move {
+                        let operation = ConsensusOperations::finish_resharding(collection_id, key);
+                        if let Err(error) = proposal_sender.send(operation) {
+                            log::error!("Can't report resharding progress to consensus: {error}");
+                        };
+                    }
+                };
+
+                let on_failure = {
+                    let collection_id = collection_id.clone();
+                    let key = key.clone();
+                    async move {
+                        if let Err(error) = proposal_sender
+                            .send(ConsensusOperations::abort_resharding(collection_id, key))
+                        {
+                            log::error!("Can't report resharding progress to consensus: {error}");
+                        };
+                    }
+                };
+
+                collection
+                    .start_resharding(key, consensus, on_finish, on_failure)
+                    .await?;
+            }
+
+            ReshardingOperation::CommitRead(key) => {
+                collection.commit_read_hashring(&key).await?;
+            }
+
+            ReshardingOperation::CommitWrite(key) => {
+                collection.commit_write_hashring(&key).await?;
+            }
+
+            ReshardingOperation::Finish(key) => {
+                collection.finish_resharding(key).await?;
+            }
+
+            ReshardingOperation::Abort(key) => {
+                collection.abort_resharding(key, false).await?;
+            }
+        }
+
+        Ok(())
+    }
+
     async fn handle_transfer(
         &self,
         collection_id: CollectionId,
         transfer_operation: ShardTransferOperations,
     ) -> Result<(), StorageError> {
         let collection = self.get_collection_unchecked(&collection_id).await?;
-        let proposal_sender = if let Some(proposal_sender) = self.consensus_proposal_sender.clone()
-        {
-            proposal_sender
-        } else {
+        let Some(proposal_sender) = self.consensus_proposal_sender.clone() else {
             return Err(StorageError::service_error(
                 "Can't handle transfer, this is a single node deployment",
             ));
@@ -271,11 +378,10 @@ impl TableOfContent {
         match transfer_operation {
             ShardTransferOperations::Start(transfer) => {
                 let collection_state::State {
-                    config: _,
                     shards,
                     transfers,
-                    shards_key_mapping: _,
-                    payload_index_schema: _,
+                    shards_key_mapping,
+                    ..
                 } = collection.state().await;
                 let all_peers: HashSet<_> = self
                     .channel_service
@@ -284,7 +390,13 @@ impl TableOfContent {
                     .keys()
                     .cloned()
                     .collect();
-                let shard_state = shards.get(&transfer.shard_id).map(|info| &info.replicas);
+
+                let source_replicas = shards.get(&transfer.shard_id).map(|info| &info.replicas);
+
+                let destination_replicas = transfer
+                    .to_shard_id
+                    .and_then(|to_shard_id| shards.get(&to_shard_id))
+                    .map(|info| &info.replicas);
 
                 // Valid transfer:
                 // All peers: 123, 321, 111, 222, 333
@@ -299,8 +411,10 @@ impl TableOfContent {
                 transfer::helpers::validate_transfer(
                     &transfer,
                     &all_peers,
-                    shard_state,
+                    source_replicas,
+                    destination_replicas,
                     &transfers,
+                    &shards_key_mapping,
                 )?;
 
                 let on_finish = {
@@ -312,7 +426,7 @@ impl TableOfContent {
                             ConsensusOperations::finish_transfer(collection_id, transfer);
 
                         if let Err(error) = proposal_sender.send(operation) {
-                            log::error!("Can't report transfer progress to consensus: {}", error)
+                            log::error!("Can't report transfer progress to consensus: {error}");
                         };
                     }
                 };
@@ -328,12 +442,12 @@ impl TableOfContent {
                                 "transmission failed",
                             ))
                         {
-                            log::error!("Can't report transfer progress to consensus: {}", error)
+                            log::error!("Can't report transfer progress to consensus: {error}");
                         };
                     }
                 };
 
-                let shard_consensus = match self.shard_transfer_dispatcher.lock().as_ref() {
+                let shard_consensus = match self.toc_dispatcher.lock().as_ref() {
                     Some(consensus) => Box::new(consensus.clone()),
                     None => {
                         return Err(StorageError::service_error(
@@ -386,6 +500,7 @@ impl TableOfContent {
 
                 let new_transfer = ShardTransfer {
                     shard_id: transfer_restart.shard_id,
+                    to_shard_id: None,
                     from: transfer_restart.from,
                     to: transfer_restart.to,
                     sync: old_transfer.sync, // Preserve sync flag from the old transfer
@@ -406,6 +521,7 @@ impl TableOfContent {
                     &transfer.key(),
                     &collection.state().await.transfers,
                 )?;
+
                 collection.finish_shard_transfer(transfer, None).await?;
             }
             ShardTransferOperations::RecoveryToPartial(transfer)
@@ -448,7 +564,7 @@ impl TableOfContent {
                 }
 
                 log::debug!(
-                    "Set shard replica state from {current_state:?} to {:?} after snapshot recovery",
+                    "Set shard replica state from {current_state:?} to {:?}",
                     ReplicaState::Partial,
                 );
 
@@ -512,8 +628,15 @@ impl TableOfContent {
     ) -> Result<(), StorageError> {
         self.get_collection_unchecked(&operation.collection_name)
             .await?
-            .create_payload_index(operation.field_name, operation.field_schema)
+            .create_payload_index(operation.field_name.clone(), operation.field_schema)
             .await?;
+
+        // We can solve issues related to this missing index
+        issues::publish(IndexCreatedEvent {
+            collection_id: operation.collection_name,
+            field_name: operation.field_name,
+        });
+
         Ok(())
     }
 

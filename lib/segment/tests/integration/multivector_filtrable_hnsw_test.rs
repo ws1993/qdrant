@@ -11,21 +11,17 @@ use rstest::rstest;
 use segment::data_types::vectors::{only_default_multi_vector, QueryVector, DEFAULT_VECTOR_NAME};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_multi_vector};
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
-use segment::index::hnsw_index::hnsw::HNSWIndex;
+use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{PayloadIndex, VectorIndex};
-use segment::json_path::path;
 use segment::segment_constructor::build_segment;
 use segment::types::{
-    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, MultiVectorConfig, Payload,
+    Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, MultiVectorConfig,
     PayloadSchemaType, Range, SearchParams, SegmentConfig, SeqNumberType, VectorDataConfig,
     VectorStorageType,
 };
-use segment::vector_storage::query::context_query::ContextPair;
-use segment::vector_storage::query::discovery_query::DiscoveryQuery;
-use segment::vector_storage::query::reco_query::RecoQuery;
-use serde_json::json;
+use segment::vector_storage::query::{ContextPair, DiscoveryQuery, RecoQuery};
+use segment::vector_storage::VectorStorage;
 use tempfile::Builder;
 
 const MAX_EXAMPLE_PAIRS: usize = 4;
@@ -104,6 +100,11 @@ fn test_multi_filterable_hnsw(
     #[case] ef: usize,
     #[case] max_failures: usize, // out of 100
 ) {
+    use common::counter::hardware_counter::HardwareCounterCell;
+    use segment::json_path::JsonPath;
+    use segment::payload_json;
+    use segment::segment_constructor::VectorIndexBuildArgs;
+
     let stopped = AtomicBool::new(false);
 
     let vector_dim = 8;
@@ -128,7 +129,7 @@ fn test_multi_filterable_hnsw(
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {}, // uses plain index for comparison
                 quantization_config: None,
-                multivec_config: Some(MultiVectorConfig::default()), // uses multivec config
+                multivector_config: Some(MultiVectorConfig::default()), // uses multivec config
                 datatype: None,
             },
         )]),
@@ -138,6 +139,8 @@ fn test_multi_filterable_hnsw(
 
     let int_key = "int";
 
+    let hw_counter = HardwareCounterCell::new();
+
     let mut segment = build_segment(dir.path(), &config, true).unwrap();
     for n in 0..num_points {
         let idx = n.into();
@@ -146,18 +149,29 @@ fn test_multi_filterable_hnsw(
         let multi_vec = random_multi_vector(&mut rnd, vector_dim, num_vector_for_point);
 
         let int_payload = random_int_payload(&mut rnd, num_payload_values..=num_payload_values);
-        let payload: Payload = json!({int_key:int_payload,}).into();
+        let payload = payload_json! {int_key: int_payload};
 
         let named_vectors = only_default_multi_vector(&multi_vec);
         segment
-            .upsert_point(n as SeqNumberType, idx, named_vectors)
+            .upsert_point(n as SeqNumberType, idx, named_vectors, &hw_counter)
             .unwrap();
         segment
-            .set_full_payload(n as SeqNumberType, idx, &payload)
+            .set_full_payload(n as SeqNumberType, idx, &payload, &hw_counter)
             .unwrap();
     }
+    assert_eq!(
+        segment.vector_data[DEFAULT_VECTOR_NAME]
+            .vector_storage
+            .borrow()
+            .total_vector_count(),
+        num_points as usize
+    );
 
     let payload_index_ptr = segment.payload_index.clone();
+    payload_index_ptr
+        .borrow_mut()
+        .set_indexed(&JsonPath::new(int_key), PayloadSchemaType::Integer)
+        .unwrap();
 
     let hnsw_config = HnswConfig {
         m,
@@ -173,24 +187,23 @@ fn test_multi_filterable_hnsw(
 
     let vector_storage = &segment.vector_data[DEFAULT_VECTOR_NAME].vector_storage;
     let quantized_vectors = &segment.vector_data[DEFAULT_VECTOR_NAME].quantized_vectors;
-    let mut hnsw_index = HNSWIndex::<GraphLinksRam>::open(
-        hnsw_dir.path(),
-        segment.id_tracker.clone(),
-        vector_storage.clone(),
-        quantized_vectors.clone(),
-        payload_index_ptr.clone(),
-        hnsw_config,
+    let hnsw_index = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: vector_storage.clone(),
+            quantized_vectors: quantized_vectors.clone(),
+            payload_index: payload_index_ptr,
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+        },
     )
     .unwrap();
-
-    hnsw_index.build_index(permit.clone(), &stopped).unwrap();
-
-    payload_index_ptr
-        .borrow_mut()
-        .set_indexed(&path(int_key), PayloadSchemaType::Integer.into())
-        .unwrap();
-
-    hnsw_index.build_index(permit, &stopped).unwrap();
 
     let top = 3;
     let mut hits = 0;
@@ -206,12 +219,12 @@ fn test_multi_filterable_hnsw(
         let right_range = left_range + range_size;
 
         let filter = Filter::new_must(Condition::Field(FieldCondition::new_range(
-            path(int_key),
+            JsonPath::new(int_key),
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(left_range as f64),
-                lte: Some(right_range as f64),
+                gte: Some(f64::from(left_range)),
+                lte: Some(f64::from(right_range)),
             },
         )));
 
@@ -249,10 +262,10 @@ fn test_multi_filterable_hnsw(
         if plain_result == index_result {
             hits += 1;
         } else {
-            eprintln!("Attempt {}/{}", i, attempts);
-            eprintln!("Different results for query {:?}", query);
-            eprintln!("plain_result = {:#?}", plain_result);
-            eprintln!("index_result = {:#?}", index_result);
+            eprintln!("Attempt {i}/{attempts}");
+            eprintln!("Different results for query {query:?}");
+            eprintln!("plain_result = {plain_result:#?}");
+            eprintln!("index_result = {index_result:#?}");
         }
     }
     assert!(

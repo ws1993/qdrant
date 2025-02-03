@@ -46,7 +46,7 @@ if [ "$MODE" == "distributed" ]; then
   sleep 10
 fi
 
-./tests/openapi_integration_test.sh
+pytest tests/openapi --durations=10
 
 ./tests/basic_api_test.sh
 
@@ -57,3 +57,5 @@ fi
 ./tests/basic_sparse_grpc_test.sh
 
 ./tests/basic_multivector_grpc_test.sh
+
+./tests/basic_query_grpc_test.sh

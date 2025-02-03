@@ -30,12 +30,11 @@ pub async fn handle_existing_collections(
 
     consensus_state.is_leader_established.await_ready();
     for collection_name in collections {
-        let collection_obj = match toc_arc
+        let Ok(collection_obj) = toc_arc
             .get_collection(&multipass.issue_pass(&collection_name))
             .await
-        {
-            Ok(collection_obj) => collection_obj,
-            Err(_) => break,
+        else {
+            break;
         };
 
         let collection_state = collection_obj.state().await;
@@ -63,8 +62,11 @@ pub async fn handle_existing_collections(
                 optimizers_config: Some(collection_state.config.optimizer_config.into()),
                 init_from: None,
                 quantization_config: collection_state.config.quantization_config,
+                strict_mode_config: collection_state.config.strict_mode_config,
+                uuid: collection_state.config.uuid,
             },
-        );
+        )
+        .expect("Failed to create collection operation");
 
         let mut consensus_operations = Vec::new();
 

@@ -1,3 +1,4 @@
+use api::rest::ShardKeySelector;
 use schemars::JsonSchema;
 use segment::json_path::JsonPath;
 use segment::types::{Filter, Payload, PayloadKeyType, PointIdType};
@@ -7,9 +8,7 @@ use strum::{EnumDiscriminants, EnumIter};
 use validator::Validate;
 
 use super::{split_iter_by_shard, OperationToShard, SplitByShard};
-use crate::hash_ring::HashRing;
-use crate::operations::shard_key_selector::ShardKeySelector;
-use crate::shards::shard::ShardId;
+use crate::hash_ring::HashRingRouter;
 
 /// This data structure is used in API interface and applied across multiple shards
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
@@ -31,7 +30,7 @@ pub struct SetPayload {
 ///
 /// Unlike `SetPayload` it does not contain `shard_key` field
 /// as individual shard does not need to know about shard key
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Validate)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct SetPayloadOp {
     pub payload: Payload,
     /// Assigns payload to each point in this list
@@ -99,7 +98,7 @@ pub struct DeletePayload {
 ///
 /// Unlike `DeletePayload` it does not contain `shard_key` field
 /// as individual shard does not need to know about shard key
-#[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Validate)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct DeletePayloadOp {
     /// List of payload keys to remove from payload
     pub keys: Vec<PayloadKeyType>,
@@ -161,22 +160,42 @@ impl PayloadOps {
             PayloadOps::OverwritePayload(_) => true,
         }
     }
-}
 
-impl Validate for PayloadOps {
-    fn validate(&self) -> Result<(), validator::ValidationErrors> {
+    pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
         match self {
-            PayloadOps::SetPayload(operation) => operation.validate(),
-            PayloadOps::DeletePayload(operation) => operation.validate(),
-            PayloadOps::ClearPayload { .. } => Ok(()),
-            PayloadOps::ClearPayloadByFilter(_) => Ok(()),
-            PayloadOps::OverwritePayload(operation) => operation.validate(),
+            Self::SetPayload(op) => op.points.clone(),
+            Self::DeletePayload(op) => op.points.clone(),
+            Self::ClearPayload { points } => Some(points.clone()),
+            Self::ClearPayloadByFilter(_) => None,
+            Self::OverwritePayload(op) => op.points.clone(),
+        }
+    }
+
+    pub fn retain_point_ids<F>(&mut self, filter: F)
+    where
+        F: Fn(&PointIdType) -> bool,
+    {
+        match self {
+            Self::SetPayload(op) => retain_opt(op.points.as_mut(), filter),
+            Self::DeletePayload(op) => retain_opt(op.points.as_mut(), filter),
+            Self::ClearPayload { points } => points.retain(filter),
+            Self::ClearPayloadByFilter(_) => (),
+            Self::OverwritePayload(op) => retain_opt(op.points.as_mut(), filter),
         }
     }
 }
 
+fn retain_opt<T, F>(vec: Option<&mut Vec<T>>, filter: F)
+where
+    F: Fn(&T) -> bool,
+{
+    if let Some(vec) = vec {
+        vec.retain(filter);
+    }
+}
+
 impl SplitByShard for PayloadOps {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self> {
+    fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self> {
         match self {
             PayloadOps::SetPayload(operation) => {
                 operation.split_by_shard(ring).map(PayloadOps::SetPayload)
@@ -195,7 +214,7 @@ impl SplitByShard for PayloadOps {
 }
 
 impl SplitByShard for DeletePayloadOp {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self> {
+    fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self> {
         match (&self.points, &self.filter) {
             (Some(_), _) => {
                 split_iter_by_shard(self.points.unwrap(), |id| *id, ring).map(|points| {
@@ -213,7 +232,7 @@ impl SplitByShard for DeletePayloadOp {
 }
 
 impl SplitByShard for SetPayloadOp {
-    fn split_by_shard(self, ring: &HashRing<ShardId>) -> OperationToShard<Self> {
+    fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self> {
         match (&self.points, &self.filter) {
             (Some(_), _) => {
                 split_iter_by_shard(self.points.unwrap(), |id| *id, ring).map(|points| {

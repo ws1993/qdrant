@@ -19,7 +19,7 @@ from .utils import (
     REST_URI,
     SECRET,
     encode_jwt,
-    random_str,
+    random_str, decode_jwt,
 )
 
 COLL_NAME = "jwt_test_collection"
@@ -34,6 +34,9 @@ TOKEN_COLL_R = encode_jwt({"access": [{"collection": COLL_NAME, "access": "r"}]}
 
 # Collection read-write access token
 TOKEN_COLL_RW = encode_jwt({"access": [{"collection": COLL_NAME, "access": "rw"}]}, SECRET)
+
+# Collection points read-write access token, the one user for serverless
+TOKEN_COLL_PRW = encode_jwt({"access": [{"collection": COLL_NAME, "access": "prw"}]}, SECRET)
 
 # Collection read-write access token with payload constraint
 TOKEN_COLL_RW_PAYLOAD = encode_jwt(
@@ -54,6 +57,7 @@ POINT_ID = 0
 FIELD_NAME = "test_field"
 PEER_ID = 0
 SHARD_KEY = "existing_shard_key"
+FACET_KEY = "a"
 
 _cached_grpc_clients = None
 
@@ -83,13 +87,14 @@ def setup(jwt_cluster):
 
 
 class Access:
-    def __init__(self, r, coll_rw, m=True, coll_r=None, coll_rw_payload=None):
+    def __init__(self, r, coll_rw, m=True, coll_r=None, coll_rw_payload=None, coll_prw=None):
         self.read = r
         self.coll_rw = coll_rw
         self.manage = m
         self.coll_r = r if coll_r is None else coll_r
         self.coll_rw_payload = coll_rw if coll_rw_payload is None else coll_rw_payload
         self.coll_r_payload = self.read and self.coll_rw_payload
+        self.coll_prw = coll_prw
 
 
 class EndpointAccess:
@@ -254,6 +259,7 @@ ACTION_ACCESS = {
         "PUT /collections/{collection_name}/index",
         "qdrant.Points/CreateFieldIndex",
         coll_rw_payload=False,
+        coll_prw=False,
     ),
     "delete_index": EndpointAccess(
         False,
@@ -262,6 +268,7 @@ ACTION_ACCESS = {
         "DELETE /collections/{collection_name}/index/{field_name}",
         "qdrant.Points/DeleteFieldIndex",
         coll_rw_payload=False,
+        coll_prw=False,
     ),
     ### Collection Snapshots ###
     "list_collection_snapshots": EndpointAccess(
@@ -271,6 +278,7 @@ ACTION_ACCESS = {
         "GET /collections/{collection_name}/snapshots",
         "qdrant.Snapshots/List",
         coll_rw_payload=False,
+        coll_prw=False,
     ),
     "create_collection_snapshot": EndpointAccess(
         False,
@@ -279,6 +287,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/snapshots",
         "qdrant.Snapshots/Create",
         coll_rw_payload=False,
+        coll_prw=False,
     ),
     "delete_collection_snapshot": EndpointAccess(
         False,
@@ -287,6 +296,7 @@ ACTION_ACCESS = {
         "DELETE /collections/{collection_name}/snapshots/{snapshot_name}",
         "qdrant.Snapshots/Delete",
         coll_rw_payload=False,
+        coll_prw=False,
     ),
     "download_collection_snapshot": EndpointAccess(
         True,
@@ -294,6 +304,7 @@ ACTION_ACCESS = {
         True,
         "GET /collections/{collection_name}/snapshots/{snapshot_name}",
         coll_rw_payload=False,
+        coll_prw=False,
     ),
     "upload_collection_snapshot": EndpointAccess(
         False, False, True, "POST /collections/{collection_name}/snapshots/upload"
@@ -330,6 +341,7 @@ ACTION_ACCESS = {
         True,
         "GET /collections/{collection_name}/shards/{shard_id}/snapshots",
         coll_rw_payload=False,
+        coll_prw=False,
     ),
     "delete_shard_snapshot": EndpointAccess(
         False,
@@ -382,6 +394,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points",
         "qdrant.Points/Get",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "upsert_points": EndpointAccess(
         False,
@@ -390,6 +403,7 @@ ACTION_ACCESS = {
         "PUT /collections/{collection_name}/points",
         "qdrant.Points/Upsert",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "update_points_batch": EndpointAccess(
         False,
@@ -398,6 +412,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points/batch",
         "qdrant.Points/UpdateBatch",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "delete_points": EndpointAccess(
         False,
@@ -405,6 +420,7 @@ ACTION_ACCESS = {
         True,
         "POST /collections/{collection_name}/points/delete",
         "qdrant.Points/Delete",
+        coll_prw=True,
     ),
     "update_vectors": EndpointAccess(
         False,
@@ -413,6 +429,7 @@ ACTION_ACCESS = {
         "PUT /collections/{collection_name}/points/vectors",
         "qdrant.Points/UpdateVectors",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "delete_vectors": EndpointAccess(
         False,
@@ -420,6 +437,7 @@ ACTION_ACCESS = {
         True,
         "POST /collections/{collection_name}/points/vectors/delete",
         "qdrant.Points/DeleteVectors",
+        coll_prw=True,
     ),
     "set_payload": EndpointAccess(
         False,
@@ -428,6 +446,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points/payload",
         "qdrant.Points/SetPayload",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "overwrite_payload": EndpointAccess(
         False,
@@ -436,6 +455,7 @@ ACTION_ACCESS = {
         "PUT /collections/{collection_name}/points/payload",
         "qdrant.Points/OverwritePayload",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "delete_payload": EndpointAccess(
         False,
@@ -444,6 +464,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points/payload/delete",
         "qdrant.Points/DeletePayload",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "clear_payload": EndpointAccess(
         False,
@@ -452,6 +473,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points/payload/clear",
         "qdrant.Points/ClearPayload",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "scroll_points": EndpointAccess(
         True,
@@ -459,6 +481,7 @@ ACTION_ACCESS = {
         True,
         "POST /collections/{collection_name}/points/scroll",
         "qdrant.Points/Scroll",
+        coll_prw=True,
     ),
     "search_points": EndpointAccess(
         True,
@@ -466,6 +489,7 @@ ACTION_ACCESS = {
         True,
         "POST /collections/{collection_name}/points/search",
         "qdrant.Points/Search",
+        coll_prw=True,
     ),
     "search_points_batch": EndpointAccess(
         True,
@@ -473,6 +497,7 @@ ACTION_ACCESS = {
         True,
         "POST /collections/{collection_name}/points/search/batch",
         "qdrant.Points/SearchBatch",
+        coll_prw=True,
     ),
     "search_point_groups": EndpointAccess(
         True,
@@ -480,6 +505,7 @@ ACTION_ACCESS = {
         True,
         "POST /collections/{collection_name}/points/search/groups",
         "qdrant.Points/SearchGroups",
+        coll_prw=True,
     ),
     "recommend_points": EndpointAccess(
         True,
@@ -488,6 +514,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points/recommend",
         "qdrant.Points/Recommend",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "recommend_points_batch": EndpointAccess(
         True,
@@ -496,6 +523,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points/recommend/batch",
         "qdrant.Points/RecommendBatch",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "recommend_point_groups": EndpointAccess(
         True,
@@ -504,6 +532,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points/recommend/groups",
         "qdrant.Points/RecommendGroups",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "discover_points": EndpointAccess(
         True,
@@ -512,6 +541,7 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points/discover",
         "qdrant.Points/Discover",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "discover_points_batch": EndpointAccess(
         True,
@@ -520,20 +550,50 @@ ACTION_ACCESS = {
         "POST /collections/{collection_name}/points/discover/batch",
         "qdrant.Points/DiscoverBatch",
         coll_rw_payload=False,
+        coll_prw=True,
     ),
     "count_points": EndpointAccess(
         True, True, True, "POST /collections/{collection_name}/points/count", "qdrant.Points/Count"
+    ),
+    "query_points": EndpointAccess(
+        True, True, True, "POST /collections/{collection_name}/points/query", "qdrant.Points/Query"
+    ),
+    "query_batch_points": EndpointAccess(
+        True, True, True, "POST /collections/{collection_name}/points/query/batch", "qdrant.Points/QueryBatch"
+    ),
+    "query_points_groups": EndpointAccess(
+        True,
+        True,
+        True,
+        "POST /collections/{collection_name}/points/query/groups",
+        "qdrant.Points/QueryGroups",
+    ),
+    "search_points_matrix_offsets": EndpointAccess(
+        True,
+        True,
+        True,
+        "POST /collections/{collection_name}/points/search/matrix/offsets",
+        "qdrant.Points/SearchMatrixOffsets",
+    ),
+    "search_points_matrix_pairs": EndpointAccess(
+        True,
+        True,
+        True,
+        "POST /collections/{collection_name}/points/search/matrix/pairs", "qdrant.Points/SearchMatrixPairs"
+    ),
+    "facet": EndpointAccess(
+        True, True, True, "POST /collections/{collection_name}/facet", "qdrant.Points/Facet"
     ),
     ### Service ###
     "root": EndpointAccess(True, True, True, "GET /", "qdrant.Qdrant/HealthCheck"),
     "readyz": EndpointAccess(True, True, True, "GET /readyz", "grpc.health.v1.Health/Check"),
     "healthz": EndpointAccess(True, True, True, "GET /healthz", "grpc.health.v1.Health/Check"),
     "livez": EndpointAccess(True, True, True, "GET /livez", "grpc.health.v1.Health/Check"),
-    "telemetry": EndpointAccess(True, False, True, "GET /telemetry", coll_r=False),
+    "telemetry": EndpointAccess(True, True, True, "GET /telemetry"),
     "metrics": EndpointAccess(True, False, True, "GET /metrics", coll_r=False),
     "post_locks": EndpointAccess(False, False, True, "POST /locks"),
     "get_locks": EndpointAccess(True, False, True, "GET /locks", coll_r=False),
-    "get_issues": EndpointAccess(False, False, True, "GET /issues"),
+    "get_issues": EndpointAccess(True, True, True, "GET /issues"),
     "clear_issues": EndpointAccess(False, False, True, "DELETE /issues"),
 }
 
@@ -753,6 +813,18 @@ def check_access(
         path_params,
         rest_req_kwargs,
     )
+
+    if allowed_for.coll_prw is not None:
+        check_rest_access(
+            method,
+            path,
+            rest_request,
+            allowed_for.coll_prw,
+            TOKEN_COLL_PRW,
+            path_params,
+            rest_req_kwargs,
+        )
+
     check_rest_access(
         method, path, rest_request, allowed_for.manage, TOKEN_M, path_params, rest_req_kwargs
     )
@@ -1706,6 +1778,104 @@ def test_count_points():
     )
 
 
+def test_query_points():
+    check_access(
+        "query_points",
+        rest_request={"query": [0.1, 0.2, 0.3, 0.4]},
+        path_params={"collection_name": COLL_NAME},
+        grpc_request={
+            "collection_name": COLL_NAME,
+            "query": {
+                "nearest": {
+                    "dense": {
+                        "data": [0.1,0.2,0.3,0.4]
+                    }
+                }
+            },
+        },
+    )
+
+
+def test_query_batch_points():
+    check_access(
+        "query_batch_points",
+        rest_request={"searches": [{"query": [0.1, 0.2, 0.3, 0.4]}]},
+        path_params={"collection_name": COLL_NAME},
+        grpc_request={
+            "collection_name": COLL_NAME, 
+            "query_points": [
+                { 
+                    "query": {
+                        "nearest": {
+                            "dense": {
+                                "data": [0.1, 0.2, 0.3, 0.4]
+                            }
+                        }
+                    }
+                }
+            ]
+        }
+    )
+
+
+def test_query_points_groups():
+    check_access(
+        "query_points_groups",
+        path_params={"collection_name": COLL_NAME},
+        rest_request={
+            "query": [0.1, 0.2, 0.3, 0.4],
+            "limit": 3,
+            "group_size": 2,
+            "group_by": FIELD_NAME
+        },
+        grpc_request={
+            "collection_name": COLL_NAME,
+            "query": {
+                "nearest": {
+                    "dense": {
+                        "data": [0.1, 0.2, 0.3, 0.4]
+                    }
+                }
+            },
+            "limit": 3,
+            "group_size": 2,
+            "group_by": FIELD_NAME
+        },
+    )
+
+
+def test_search_points_matrix_offsets():
+    check_access(
+        "search_points_matrix_offsets",
+        rest_request={"sample": 10, "limit": 2},
+        path_params={"collection_name": COLL_NAME},
+        grpc_request={"collection_name": COLL_NAME, "sample": 10, "limit": 2},
+    )
+
+
+def test_search_points_matrix_pairs():
+    check_access(
+        "search_points_matrix_pairs",
+        rest_request={"sample": 10, "limit": 2},
+        path_params={"collection_name": COLL_NAME},
+        grpc_request={"collection_name": COLL_NAME, "sample": 10, "limit": 2},
+    )
+
+
+def test_facet():
+    check_access(
+        "facet",
+        path_params={"collection_name": COLL_NAME},
+        rest_request={
+            "key": FACET_KEY,
+        },
+        grpc_request={
+            "collection_name": COLL_NAME,
+            "key": FACET_KEY,
+        },
+    )
+
+
 def test_root():
     check_access("root")
 
@@ -1740,6 +1910,7 @@ def test_get_locks():
 
 def test_get_issues():
     check_access("get_issues")
+
 
 def test_clear_issues():
     check_access("clear_issues")

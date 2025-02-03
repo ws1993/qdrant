@@ -15,7 +15,9 @@ impl Collection {
     pub async fn create_replica_set(
         &self,
         shard_id: ShardId,
+        shard_key: Option<ShardKey>,
         replicas: &[PeerId],
+        init_state: Option<ReplicaState>,
     ) -> Result<ShardReplicaSet, CollectionError> {
         let is_local = replicas.contains(&self.this_peer_id);
 
@@ -25,8 +27,11 @@ impl Collection {
             .filter(|peer_id| *peer_id != self.this_peer_id)
             .collect();
 
+        let effective_optimizers_config = self.effective_optimizers_config().await?;
+
         ShardReplicaSet::build(
             shard_id,
+            shard_key,
             self.name(),
             self.this_peer_id,
             is_local,
@@ -35,12 +40,14 @@ impl Collection {
             self.abort_shard_transfer_cb.clone(),
             &self.path,
             self.collection_config.clone(),
+            effective_optimizers_config,
             self.shared_storage_config.clone(),
+            self.payload_index_schema.clone(),
             self.channel_service.clone(),
             self.update_runtime.clone(),
             self.search_runtime.clone(),
             self.optimizer_cpu_budget.clone(),
-            Some(ReplicaState::Active),
+            Some(init_state.unwrap_or(ReplicaState::Active)),
         )
         .await
     }
@@ -57,8 +64,7 @@ impl Collection {
         match state.config.params.sharding_method.unwrap_or_default() {
             ShardingMethod::Auto => {
                 return Err(CollectionError::bad_request(format!(
-                    "Shard Key {} cannot be created with Auto sharding method",
-                    shard_key
+                    "Shard Key {shard_key} cannot be created with Auto sharding method"
                 )));
             }
             ShardingMethod::Custom => {}
@@ -66,8 +72,7 @@ impl Collection {
 
         if state.shards_key_mapping.contains_key(&shard_key) {
             return Err(CollectionError::bad_request(format!(
-                "Shard key {} already exists",
-                shard_key
+                "Shard key {shard_key} already exists"
             )));
         }
 
@@ -87,8 +92,7 @@ impl Collection {
 
         if !unknown_peers.is_empty() {
             return Err(CollectionError::bad_request(format!(
-                "Shard Key {} placement contains unknown peers: {:?}",
-                shard_key, unknown_peers
+                "Shard Key {shard_key} placement contains unknown peers: {unknown_peers:?}"
             )));
         }
 
@@ -100,7 +104,12 @@ impl Collection {
             let shard_id = max_shard_id + idx as ShardId + 1;
 
             let replica_set = self
-                .create_replica_set(shard_id, shard_replicas_placement)
+                .create_replica_set(
+                    shard_id,
+                    Some(shard_key.clone()),
+                    shard_replicas_placement,
+                    None,
+                )
                 .await?;
 
             for (field_name, field_schema) in payload_schema.iter() {
@@ -131,11 +140,37 @@ impl Collection {
         match state.config.params.sharding_method.unwrap_or_default() {
             ShardingMethod::Auto => {
                 return Err(CollectionError::bad_request(format!(
-                    "Shard Key {} cannot be removed with Auto sharding method",
-                    shard_key
+                    "Shard Key {shard_key} cannot be removed with Auto sharding method"
                 )));
             }
             ShardingMethod::Custom => {}
+        }
+
+        let resharding_state = self
+            .resharding_state()
+            .await
+            .filter(|state| state.shard_key.as_ref() == Some(&shard_key));
+
+        if let Some(state) = resharding_state {
+            if let Err(err) = self.abort_resharding(state.key(), true).await {
+                log::error!(
+                    "failed to abort resharding {} while deleting shard key {shard_key}: {err}",
+                    state.key(),
+                );
+            }
+        }
+
+        // Invalidate local shard cleaning tasks
+        match self
+            .shards_holder
+            .read()
+            .await
+            .get_shard_ids_by_key(&shard_key)
+        {
+            Ok(shard_ids) => self.invalidate_clean_local_shards(shard_ids).await,
+            Err(err) => {
+                log::warn!("Failed to invalidate local shard cleaning task, ignoring: {err}");
+            }
         }
 
         self.shards_holder

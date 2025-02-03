@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
 use std::{error, result};
 
-use atomic_refcell::AtomicRefCell;
+use common::counter::hardware_counter::HardwareCounterCell;
+use common::types::PointOffsetType;
 use itertools::Itertools;
 use rand::rngs::StdRng;
 use rand::seq::IteratorRandom;
@@ -24,11 +24,10 @@ use crate::types::{
 use crate::vector_storage::dense::memmap_dense_vector_storage::open_memmap_vector_storage_with_async_io;
 use crate::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
-use crate::vector_storage::query::context_query::{ContextPair, ContextQuery};
-use crate::vector_storage::query::discovery_query::DiscoveryQuery;
-use crate::vector_storage::query::reco_query::RecoQuery;
+use crate::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
 use crate::vector_storage::tests::utils::score;
-use crate::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
+use crate::vector_storage::vector_storage_base::VectorStorage;
+use crate::vector_storage::{new_raw_scorer_for_test, VectorStorageEnum};
 
 const DIMS: usize = 128;
 const NUM_POINTS: usize = 600;
@@ -111,26 +110,23 @@ fn random_context_query<R: Rng + ?Sized>(
     ContextQuery::new(pairs).into()
 }
 
-fn ram_storage(dir: &Path) -> AtomicRefCell<VectorStorageEnum> {
-    let storage = open_simple_dense_vector_storage(
+fn ram_storage(dir: &Path) -> VectorStorageEnum {
+    open_simple_dense_vector_storage(
         rocksdb_wrapper::open_db(dir, &[rocksdb_wrapper::DB_VECTOR_CF]).unwrap(),
         rocksdb_wrapper::DB_VECTOR_CF,
         DIMS,
         DISTANCE,
         &AtomicBool::new(false),
     )
-    .unwrap();
-
-    Arc::into_inner(storage).unwrap()
+    .unwrap()
 }
 
 #[cfg(target_os = "linux")]
-fn async_memmap_storage(dir: &std::path::Path) -> AtomicRefCell<VectorStorageEnum> {
-    let storage = open_memmap_vector_storage_with_async_io(dir, DIMS, DISTANCE, true).unwrap();
-    Arc::into_inner(storage).unwrap()
+fn async_memmap_storage(dir: &std::path::Path) -> VectorStorageEnum {
+    open_memmap_vector_storage_with_async_io(dir, DIMS, DISTANCE, true).unwrap()
 }
 
-fn scalar_u8() -> Option<WithQuantization> {
+fn scalar_u8() -> WithQuantization {
     let config = ScalarQuantizationConfig {
         r#type: crate::types::ScalarType::Int8,
         quantile: Some(0.5),
@@ -143,10 +139,10 @@ fn scalar_u8() -> Option<WithQuantization> {
         Box::new(rng.sample_iter(rand_distr::Normal::new(0.0, 8.0).unwrap()))
     };
 
-    Some((config, sampler))
+    (config, sampler)
 }
 
-fn product_x4() -> Option<WithQuantization> {
+fn product_x4() -> WithQuantization {
     let config = ProductQuantizationConfig {
         compression: crate::types::CompressionRatio::X4,
         always_ram: Some(true),
@@ -158,10 +154,10 @@ fn product_x4() -> Option<WithQuantization> {
         Box::new(rng.sample_iter(rand::distributions::Standard))
     };
 
-    Some((config, sampler))
+    (config, sampler)
 }
 
-fn binary() -> Option<WithQuantization> {
+fn binary() -> WithQuantization {
     let config = BinaryQuantizationConfig {
         always_ram: Some(true),
     }
@@ -171,11 +167,11 @@ fn binary() -> Option<WithQuantization> {
         let rng = StdRng::seed_from_u64(SEED);
         Box::new(
             rng.sample_iter(rand::distributions::Uniform::new_inclusive(-1.0, 1.0))
-                .map(|x| x as u8 as f32),
+                .map(|x| f32::from(x as u8)),
         )
     };
 
-    Some((config, sampler))
+    (config, sampler)
 }
 
 enum QueryVariant {
@@ -186,7 +182,7 @@ enum QueryVariant {
 
 fn scoring_equivalency(
     query_variant: QueryVariant,
-    other_storage: impl FnOnce(&std::path::Path) -> AtomicRefCell<VectorStorageEnum>,
+    other_storage: impl FnOnce(&std::path::Path) -> VectorStorageEnum,
     with_quantization: Option<WithQuantization>,
 ) -> Result<()> {
     let (quant_config, quant_sampler) = with_quantization
@@ -197,7 +193,7 @@ fn scoring_equivalency(
 
     let db = rocksdb_wrapper::open_db(raw_dir.path(), &[rocksdb_wrapper::DB_VECTOR_CF])?;
 
-    let raw_storage = open_simple_dense_vector_storage(
+    let mut raw_storage = open_simple_dense_vector_storage(
         db,
         rocksdb_wrapper::DB_VECTOR_CF,
         DIMS,
@@ -205,12 +201,10 @@ fn scoring_equivalency(
         &AtomicBool::default(),
     )?;
 
-    let mut raw_storage = raw_storage.borrow_mut();
-
     let mut rng = StdRng::seed_from_u64(SEED);
     let mut sampler = quant_sampler.unwrap_or(Box::new(sampler(rng.clone())));
 
-    super::utils::insert_distributed_vectors(&mut raw_storage, NUM_POINTS, &mut sampler)?;
+    super::utils::insert_distributed_vectors(DIMS, &mut raw_storage, NUM_POINTS, &mut sampler)?;
 
     let mut id_tracker = FixtureIdTracker::new(NUM_POINTS);
     super::utils::delete_random_vectors(
@@ -222,10 +216,15 @@ fn scoring_equivalency(
 
     let other_dir = tempfile::Builder::new().prefix("other-storage").tempdir()?;
 
-    let other_storage = other_storage(other_dir.path());
-    let mut other_storage = other_storage.borrow_mut();
+    let mut other_storage = other_storage(other_dir.path());
 
-    other_storage.update_from(&raw_storage, &mut (0..NUM_POINTS as _), &Default::default())?;
+    let mut iter = (0..NUM_POINTS).map(|i| {
+        let i = i as PointOffsetType;
+        let vec = raw_storage.get_vector(i);
+        let deleted = raw_storage.is_deleted_vector(i);
+        (vec, deleted)
+    });
+    other_storage.update_from(&mut iter, &Default::default())?;
 
     let quant_dir = tempfile::Builder::new().prefix("quant-storage").tempdir()?;
     let quantized_vectors = if let Some(config) = &quant_config {
@@ -244,7 +243,7 @@ fn scoring_equivalency(
     for i in 0..attempts {
         let query = random_query(&query_variant, &mut rng, &mut sampler);
 
-        let raw_scorer = new_raw_scorer(
+        let raw_scorer = new_raw_scorer_for_test(
             query.clone(),
             &raw_storage,
             id_tracker.deleted_point_bitslice(),
@@ -260,9 +259,10 @@ fn scoring_equivalency(
                     id_tracker.deleted_point_bitslice(),
                     other_storage.deleted_vector_bitslice(),
                     &is_stopped,
+                    HardwareCounterCell::new(),
                 )
                 .unwrap(),
-            None => new_raw_scorer(
+            None => new_raw_scorer_for_test(
                 query.clone(),
                 &other_storage,
                 id_tracker.deleted_point_bitslice(),
@@ -281,8 +281,7 @@ fn scoring_equivalency(
             // both calculations are done on raw vectors, so score should be exactly the same
             assert_eq!(
                 raw_scores, other_scores,
-                "Scorer results are not equal, attempt: {}, query: {:?}",
-                i, query
+                "Scorer results are not equal, attempt: {i}, query: {query:?}"
             );
         } else {
             // Quantization is used for the other storage, so score should be similar
@@ -329,12 +328,9 @@ fn compare_scoring_equivalency(
         QueryVariant::Context
     )]
     query_variant: QueryVariant,
-    #[values(ram_storage)] other_storage: impl FnOnce(
-        &std::path::Path,
-    ) -> AtomicRefCell<VectorStorageEnum>,
-    #[values(None, product_x4(), scalar_u8(), binary())] quantization_config: Option<
-        WithQuantization,
-    >,
+    #[values(ram_storage)] other_storage: impl FnOnce(&std::path::Path) -> VectorStorageEnum,
+    #[values(None, Some(product_x4()), Some(scalar_u8()), Some(binary()))]
+    quantization_config: Option<WithQuantization>,
 ) -> Result<()> {
     scoring_equivalency(query_variant, other_storage, quantization_config)
 }
@@ -348,9 +344,7 @@ fn async_compare_scoring_equivalency(
         QueryVariant::Context
     )]
     query_variant: QueryVariant,
-    #[values(async_memmap_storage)] other_storage: impl FnOnce(
-        &std::path::Path,
-    ) -> AtomicRefCell<VectorStorageEnum>,
+    #[values(async_memmap_storage)] other_storage: impl FnOnce(&std::path::Path) -> VectorStorageEnum,
 ) -> Result<()> {
     scoring_equivalency(query_variant, other_storage, None)
 }

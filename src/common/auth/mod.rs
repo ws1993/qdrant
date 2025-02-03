@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::types::ScrollRequestInternal;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::{WithPayloadInterface, WithVector};
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
@@ -10,8 +11,8 @@ use storage::rbac::Access;
 use self::claims::{Claims, ValueExists};
 use self::jwt_parser::JwtParser;
 use super::strings::ct_eq;
+use crate::common::inference::InferenceToken;
 use crate::settings::ServiceConfig;
-
 pub mod claims;
 pub mod jwt_parser;
 
@@ -74,7 +75,8 @@ impl AuthKeys {
     pub async fn validate_request<'a>(
         &self,
         get_header: impl Fn(&'a str) -> Option<&'a str>,
-    ) -> Result<Access, AuthError> {
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> Result<(Access, InferenceToken), AuthError> {
         let Some(key) = get_header(HTTP_HEADER_API_KEY)
             .or_else(|| get_header("authorization").and_then(|v| v.strip_prefix("Bearer ")))
         else {
@@ -84,25 +86,33 @@ impl AuthKeys {
         };
 
         if self.can_write(key) {
-            return Ok(Access::full("Read-write access by key"));
+            return Ok((
+                Access::full("Read-write access by key"),
+                InferenceToken(None),
+            ));
         }
 
         if self.can_read(key) {
-            return Ok(Access::full_ro("Read-only access by key"));
+            return Ok((
+                Access::full_ro("Read-only access by key"),
+                InferenceToken(None),
+            ));
         }
 
         if let Some(claims) = self.jwt_parser.as_ref().and_then(|p| p.decode(key)) {
             let Claims {
+                sub,
                 exp: _, // already validated on decoding
                 access,
                 value_exists,
             } = claims?;
 
             if let Some(value_exists) = value_exists {
-                self.validate_value_exists(&value_exists).await?;
+                self.validate_value_exists(&value_exists, hw_measurement_acc)
+                    .await?;
             }
 
-            return Ok(access);
+            return Ok((access, InferenceToken(sub)));
         }
 
         Err(AuthError::Unauthorized(
@@ -110,7 +120,11 @@ impl AuthKeys {
         ))
     }
 
-    async fn validate_value_exists(&self, value_exists: &ValueExists) -> Result<(), AuthError> {
+    async fn validate_value_exists(
+        &self,
+        value_exists: &ValueExists,
+        hw_measurement_acc: HwMeasurementAcc,
+    ) -> Result<(), AuthError> {
         let scroll_req = ScrollRequestInternal {
             offset: None,
             limit: Some(1),
@@ -126,8 +140,10 @@ impl AuthKeys {
                 value_exists.get_collection(),
                 scroll_req,
                 None,
+                None, // no timeout
                 ShardSelectorInternal::All,
                 Access::full("JWT stateful validation"),
+                hw_measurement_acc,
             )
             .await
             .map_err(|e| match e {
@@ -151,8 +167,7 @@ impl AuthKeys {
     fn can_read(&self, key: &str) -> bool {
         self.read_only
             .as_ref()
-            .map(|ro_key| ct_eq(ro_key, key))
-            .unwrap_or_default()
+            .is_some_and(|ro_key| ct_eq(ro_key, key))
     }
 
     /// Check if a key is allowed to write
@@ -160,7 +175,6 @@ impl AuthKeys {
     fn can_write(&self, key: &str) -> bool {
         self.read_write
             .as_ref()
-            .map(|rw_key| ct_eq(rw_key, key))
-            .unwrap_or_default()
+            .is_some_and(|rw_key| ct_eq(rw_key, key))
     }
 }

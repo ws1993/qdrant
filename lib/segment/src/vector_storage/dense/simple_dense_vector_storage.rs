@@ -4,7 +4,6 @@ use std::ops::Range;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
-use atomic_refcell::AtomicRefCell;
 use bitvec::prelude::{BitSlice, BitVec};
 use common::types::PointOffsetType;
 use log::debug;
@@ -16,9 +15,10 @@ use crate::common::rocksdb_wrapper::DatabaseColumnWrapper;
 use crate::common::Flusher;
 use crate::data_types::named_vectors::CowVector;
 use crate::data_types::primitive::PrimitiveVectorElement;
-use crate::data_types::vectors::{VectorElementType, VectorElementTypeByte, VectorRef};
+use crate::data_types::vectors::{VectorElementType, VectorRef};
 use crate::types::{Distance, VectorStorageDatatype};
 use crate::vector_storage::bitvec::bitvec_set_deleted;
+use crate::vector_storage::chunked_vector_storage::VectorOffsetType;
 use crate::vector_storage::chunked_vectors::ChunkedVectors;
 use crate::vector_storage::common::StoredRecord;
 use crate::vector_storage::{DenseVectorStorage, VectorStorage, VectorStorageEnum};
@@ -26,6 +26,7 @@ use crate::vector_storage::{DenseVectorStorage, VectorStorage, VectorStorageEnum
 type StoredDenseVector<T> = StoredRecord<Vec<T>>;
 
 /// In-memory vector storage with on-update persistence using `store`
+#[derive(Debug)]
 pub struct SimpleDenseVectorStorage<T: PrimitiveVectorElement> {
     dim: usize,
     distance: Distance,
@@ -61,7 +62,7 @@ fn open_simple_dense_vector_storage_impl<T: PrimitiveVectorElement>(
             bitvec_set_deleted(&mut deleted, point_id, true);
             deleted_count += 1;
         }
-        vectors.insert(point_id, &stored_record.vector)?;
+        vectors.insert(point_id as VectorOffsetType, &stored_record.vector)?;
 
         check_process_stopped(stopped)?;
     }
@@ -92,7 +93,7 @@ pub fn open_simple_dense_vector_storage(
     dim: usize,
     distance: Distance,
     stopped: &AtomicBool,
-) -> OperationResult<Arc<AtomicRefCell<VectorStorageEnum>>> {
+) -> OperationResult<VectorStorageEnum> {
     let storage = open_simple_dense_vector_storage_impl::<VectorElementType>(
         database,
         database_column_name,
@@ -101,9 +102,7 @@ pub fn open_simple_dense_vector_storage(
         stopped,
     )?;
 
-    Ok(Arc::new(AtomicRefCell::new(
-        VectorStorageEnum::DenseSimple(storage),
-    )))
+    Ok(VectorStorageEnum::DenseSimple(storage))
 }
 
 pub fn open_simple_dense_byte_vector_storage(
@@ -112,8 +111,8 @@ pub fn open_simple_dense_byte_vector_storage(
     dim: usize,
     distance: Distance,
     stopped: &AtomicBool,
-) -> OperationResult<Arc<AtomicRefCell<VectorStorageEnum>>> {
-    let storage = open_simple_dense_vector_storage_impl::<VectorElementTypeByte>(
+) -> OperationResult<VectorStorageEnum> {
+    let storage = open_simple_dense_vector_storage_impl(
         database,
         database_column_name,
         dim,
@@ -121,16 +120,32 @@ pub fn open_simple_dense_byte_vector_storage(
         stopped,
     )?;
 
-    Ok(Arc::new(AtomicRefCell::new(
-        VectorStorageEnum::DenseSimpleByte(storage),
-    )))
+    Ok(VectorStorageEnum::DenseSimpleByte(storage))
+}
+
+pub fn open_simple_dense_half_vector_storage(
+    database: Arc<RwLock<DB>>,
+    database_column_name: &str,
+    dim: usize,
+    distance: Distance,
+    stopped: &AtomicBool,
+) -> OperationResult<VectorStorageEnum> {
+    let storage = open_simple_dense_vector_storage_impl(
+        database,
+        database_column_name,
+        dim,
+        distance,
+        stopped,
+    )?;
+
+    Ok(VectorStorageEnum::DenseSimpleHalf(storage))
 }
 
 impl<T: PrimitiveVectorElement> SimpleDenseVectorStorage<T> {
     /// Set deleted flag for given key. Returns previous deleted state.
     #[inline]
     fn set_deleted(&mut self, key: PointOffsetType, deleted: bool) -> bool {
-        if key as usize >= self.vectors.len() {
+        if !deleted && key as usize >= self.vectors.len() {
             return false;
         }
         let was_deleted = bitvec_set_deleted(&mut self.deleted, key, deleted);
@@ -168,16 +183,16 @@ impl<T: PrimitiveVectorElement> SimpleDenseVectorStorage<T> {
 }
 
 impl<T: PrimitiveVectorElement> DenseVectorStorage<T> for SimpleDenseVectorStorage<T> {
-    fn get_dense(&self, key: PointOffsetType) -> &[T] {
-        self.vectors.get(key)
-    }
-}
-
-impl<T: PrimitiveVectorElement> VectorStorage for SimpleDenseVectorStorage<T> {
     fn vector_dim(&self) -> usize {
         self.dim
     }
 
+    fn get_dense(&self, key: PointOffsetType) -> &[T] {
+        self.vectors.get(key as VectorOffsetType)
+    }
+}
+
+impl<T: PrimitiveVectorElement> VectorStorage for SimpleDenseVectorStorage<T> {
     fn distance(&self) -> Distance {
         self.distance
     }
@@ -195,32 +210,37 @@ impl<T: PrimitiveVectorElement> VectorStorage for SimpleDenseVectorStorage<T> {
     }
 
     fn get_vector(&self, key: PointOffsetType) -> CowVector {
-        CowVector::from(T::slice_to_float_cow(self.vectors.get(key).into()))
+        self.get_vector_opt(key).expect("vector not found")
+    }
+
+    /// Get vector by key, if it exists.
+    fn get_vector_opt(&self, key: PointOffsetType) -> Option<CowVector> {
+        self.vectors
+            .get_opt(key as VectorOffsetType)
+            .map(|slice| CowVector::from(T::slice_to_float_cow(slice.into())))
     }
 
     fn insert_vector(&mut self, key: PointOffsetType, vector: VectorRef) -> OperationResult<()> {
         let vector: &[VectorElementType] = vector.try_into()?;
         let vector = T::slice_from_float_cow(Cow::from(vector));
-        self.vectors.insert(key, vector.as_ref())?;
+        self.vectors
+            .insert(key as VectorOffsetType, vector.as_ref())?;
         self.set_deleted(key, false);
         self.update_stored(key, false, Some(vector.as_ref()))?;
         Ok(())
     }
 
-    fn update_from(
+    fn update_from<'a>(
         &mut self,
-        other: &VectorStorageEnum,
-        other_ids: &mut impl Iterator<Item = PointOffsetType>,
+        other_ids: &'a mut impl Iterator<Item = (CowVector<'a>, bool)>,
         stopped: &AtomicBool,
     ) -> OperationResult<Range<PointOffsetType>> {
         let start_index = self.vectors.len() as PointOffsetType;
-        for point_id in other_ids {
+        for (other_vector, other_deleted) in other_ids {
             check_process_stopped(stopped)?;
             // Do not perform preprocessing - vectors should be already processed
-            let other_vector = other.get_vector(point_id);
             let other_vector = T::slice_from_float_cow(Cow::try_from(other_vector)?);
-            let other_deleted = other.is_deleted_vector(point_id);
-            let new_id = self.vectors.push(other_vector.as_ref())?;
+            let new_id = self.vectors.push(other_vector.as_ref())? as PointOffsetType;
             self.set_deleted(new_id, other_deleted);
             self.update_stored(new_id, other_deleted, Some(other_vector.as_ref()))?;
         }

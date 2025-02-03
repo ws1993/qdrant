@@ -72,6 +72,11 @@ impl CpuBudget {
         }
     }
 
+    /// Returns the total CPU budget.
+    pub fn available_cpu_budget(&self) -> usize {
+        self.cpu_budget
+    }
+
     /// For the given desired number of CPUs, return the minimum number of required CPUs.
     fn min_permits(&self, desired_cpus: usize) -> usize {
         desired_cpus.min(self.cpu_budget).div_ceil(2)
@@ -115,7 +120,7 @@ impl CpuBudget {
     /// Check if there are at least `budget` available CPUs in this budget.
     ///
     /// A budget of `0` will always return `true`.
-    fn has_budget_exact(&self, budget: usize) -> bool {
+    pub fn has_budget_exact(&self, budget: usize) -> bool {
         self.semaphore.available_permits() >= budget
     }
 
@@ -189,6 +194,17 @@ impl CpuPermit {
     pub fn release(&mut self) {
         self.permit.take();
     }
+
+    /// Partial release CPU permit, giving them back to the semaphore.
+    pub fn release_count(&mut self, release_count: u32) {
+        if self.num_cpus > release_count {
+            self.num_cpus -= release_count;
+            let permit = self.permit.take();
+            self.permit = permit.and_then(|mut permit| permit.split(self.num_cpus as usize));
+        } else {
+            self.release();
+        }
+    }
 }
 
 impl Drop for CpuPermit {
@@ -203,7 +219,7 @@ pub enum ThreadPriorityError {
     #[error("Failed to set thread priority: {0:?}")]
     SetThreadPriority(thread_priority::Error),
     #[error("Failed to parse thread priority value: {0}")]
-    ParseNice(&'static str),
+    ParseNice(String),
 }
 
 /// On Linux, make current thread lower priority (nice: 10).

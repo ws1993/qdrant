@@ -1,19 +1,22 @@
 use std::sync::Arc;
 
-use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+use api::rest::SearchRequestInternal;
+use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use collection::operations::point_ops::{
-    PointInsertOperationsInternal, PointOperations, PointStruct,
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted,
 };
-use collection::operations::types::{CoreSearchRequestBatch, SearchRequestInternal};
+use collection::operations::types::CoreSearchRequestBatch;
 use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::operations::CollectionUpdateOperations;
 use collection::optimizers_builder::OptimizersConfig;
+use collection::save_on_disk::SaveOnDisk;
 use collection::shards::local_shard::LocalShard;
 use collection::shards::shard_trait::ShardOperation;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::cpu::CpuBudget;
 use criterion::{criterion_group, criterion_main, Criterion};
 use rand::thread_rng;
-use segment::data_types::vectors::{only_default_vector, VectorStruct};
+use segment::data_types::vectors::{only_default_vector, VectorStructInternal};
 use segment::fixtures::payload_fixtures::random_vector;
 use segment::types::{Condition, Distance, FieldCondition, Filter, Payload, Range};
 use serde_json::Map;
@@ -34,9 +37,9 @@ fn create_rnd_batch() -> CollectionUpdateOperations {
         payload_map.insert("a".to_string(), (i % 5).into());
         let vector = random_vector(&mut rng, dim);
         let vectors = only_default_vector(&vector);
-        let point = PointStruct {
+        let point = PointStructPersisted {
             id: (i as u64).into(),
-            vector: VectorStruct::from(vectors).into(),
+            vector: VectorStructInternal::from(vectors).into(),
             payload: Some(Payload(payload_map)),
         };
         points.push(point);
@@ -64,7 +67,7 @@ fn batch_search_bench(c: &mut Criterion) {
         ..CollectionParams::empty()
     };
 
-    let collection_config = CollectionConfig {
+    let collection_config = CollectionConfigInternal {
         params: collection_params,
         optimizer_config: OptimizersConfig {
             deleted_threshold: 0.9,
@@ -79,9 +82,18 @@ fn batch_search_bench(c: &mut Criterion) {
         wal_config,
         hnsw_config: Default::default(),
         quantization_config: Default::default(),
+        strict_mode_config: Default::default(),
+        uuid: None,
     };
 
+    let optimizers_config = collection_config.optimizer_config.clone();
+
     let shared_config = Arc::new(RwLock::new(collection_config));
+
+    let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
+    let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
+    let payload_index_schema =
+        Arc::new(SaveOnDisk::load_or_init_default(payload_index_schema_file).unwrap());
 
     let shard = handle
         .block_on(LocalShard::build_local(
@@ -90,15 +102,18 @@ fn batch_search_bench(c: &mut Criterion) {
             storage_dir.path(),
             shared_config,
             Default::default(),
+            payload_index_schema,
+            handle.clone(),
             handle.clone(),
             CpuBudget::default(),
+            optimizers_config,
         ))
         .unwrap();
 
     let rnd_batch = create_rnd_batch();
 
     handle
-        .block_on(shard.update(rnd_batch.into(), true))
+        .block_on(shard.update(rnd_batch.into(), true, HwMeasurementAcc::new()))
         .unwrap();
 
     let mut group = c.benchmark_group("batch-search-bench");
@@ -140,6 +155,7 @@ fn batch_search_bench(c: &mut Criterion) {
                             with_vector: None,
                             score_threshold: None,
                         };
+                        let hw_acc = HwMeasurementAcc::new();
                         let result = shard
                             .core_search(
                                 Arc::new(CoreSearchRequestBatch {
@@ -147,6 +163,7 @@ fn batch_search_bench(c: &mut Criterion) {
                                 }),
                                 search_runtime_handle,
                                 None,
+                                hw_acc,
                             )
                             .await
                             .unwrap();
@@ -176,9 +193,10 @@ fn batch_search_bench(c: &mut Criterion) {
                         searches.push(search_query.into());
                     }
 
+                    let hw_acc = HwMeasurementAcc::new();
                     let search_query = CoreSearchRequestBatch { searches };
                     let result = shard
-                        .core_search(Arc::new(search_query), search_runtime_handle, None)
+                        .core_search(Arc::new(search_query), search_runtime_handle, None, hw_acc)
                         .await
                         .unwrap();
                     assert!(!result.is_empty());

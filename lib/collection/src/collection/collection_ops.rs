@@ -1,9 +1,10 @@
 use std::cmp;
 use std::sync::Arc;
 
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::{future, TryStreamExt as _};
 use lazy_static::lazy_static;
-use segment::types::QuantizationConfig;
+use segment::types::{QuantizationConfig, StrictModeConfig};
 use semver::Version;
 
 use super::Collection;
@@ -162,6 +163,30 @@ impl Collection {
         Ok(())
     }
 
+    /// Updates the strict mode configuration and saves it to disk.
+    pub async fn update_strict_mode_config(
+        &self,
+        strict_mode_diff: StrictModeConfig,
+    ) -> CollectionResult<()> {
+        {
+            let mut config = self.collection_config.write().await;
+            if let Some(current_config) = config.strict_mode_config.as_mut() {
+                *current_config = strict_mode_diff.update(current_config)?;
+            } else {
+                config.strict_mode_config = Some(strict_mode_diff);
+            }
+        }
+        // update collection config
+        self.collection_config.read().await.save(&self.path)?;
+        // apply config change to all shards
+        let mut shard_holder = self.shards_holder.write().await;
+        let updates = shard_holder
+            .all_shards_mut()
+            .map(|replica_set| replica_set.on_strict_mode_config_update());
+        future::try_join_all(updates).await?;
+        Ok(())
+    }
+
     /// Handle replica changes
     ///
     /// add and remove replicas from replica set
@@ -180,7 +205,7 @@ impl Collection {
                 Change::Remove(shard_id, peer_id) => (shard_id, peer_id),
             };
 
-            let Some(replica_set) = shard_holder.get_shard(&shard_id) else {
+            let Some(replica_set) = shard_holder.get_shard(shard_id) else {
                 return Err(CollectionError::BadRequest {
                     description: format!("Shard {} of {} not found", shard_id, self.name()),
                 });
@@ -194,17 +219,18 @@ impl Collection {
                 });
             }
 
-            if peers.len() == 1 {
+            // Check that we are not removing the *last* replica or the last *active* replica
+            //
+            // `is_last_active_replica` counts both `Active` and `ReshardingScaleDown` replicas!
+            if peers.len() == 1 || replica_set.is_last_active_replica(peer_id) {
                 return Err(CollectionError::BadRequest {
-                    description: format!("Shard {shard_id} must have at least one replica"),
+                    description: format!("Shard {shard_id} must have at least one active replica after removing {peer_id}"),
                 });
             }
 
-            replica_set.remove_peer(peer_id).await?;
-
             let all_nodes_cancel_transfers = self
                 .channel_service
-                .all_peers_at_version(ABORT_TRANSFERS_ON_SHARD_DROP_FROM_VERSION.clone());
+                .all_peers_at_version(&ABORT_TRANSFERS_ON_SHARD_DROP_FROM_VERSION);
             if all_nodes_cancel_transfers {
                 // Collect shard transfers related to removed shard...
                 let transfers = shard_holder
@@ -212,10 +238,19 @@ impl Collection {
 
                 // ...and cancel transfer tasks and remove transfers from internal state
                 for transfer in transfers {
-                    self.finish_shard_transfer(transfer, Some(&shard_holder))
+                    self.abort_shard_transfer(transfer.key(), Some(&shard_holder))
                         .await?;
                 }
             }
+
+            replica_set.remove_peer(peer_id).await?;
+
+            // We can't remove the last repilca of a shard, so this should prevent removing
+            // resharding shard, because it's always the *only* replica.
+            //
+            // And if we remove some other shard, that is currently doing resharding transfer,
+            // the transfer should be cancelled (see the block right above this comment),
+            // so no special handling is needed.
         }
         Ok(())
     }
@@ -235,6 +270,14 @@ impl Collection {
             .map(|replica_set| replica_set.on_optimizer_config_update());
         future::try_join_all(updates).await?;
         Ok(())
+    }
+
+    pub async fn strict_mode_config(&self) -> Option<StrictModeConfig> {
+        self.collection_config
+            .read()
+            .await
+            .strict_mode_config
+            .clone()
     }
 
     pub async fn info(
@@ -299,7 +342,6 @@ impl Collection {
 
         // extract shards info
         for (shard_id, replica_set) in shards_holder.get_shards() {
-            let shard_id = *shard_id;
             let peers = replica_set.peers();
 
             if replica_set.has_local_shard().await {
@@ -307,10 +349,15 @@ impl Collection {
                     .get(&replica_set.this_peer_id())
                     .copied()
                     .unwrap_or(ReplicaState::Dead);
+
+                // Cluster info is explicitly excluded from hardware measurements
+                // So that we can monitor hardware usage without interference
+                let hw_acc = HwMeasurementAcc::disposable();
                 let count_result = replica_set
-                    .count_local(count_request.clone())
+                    .count_local(count_request.clone(), None, hw_acc)
                     .await
                     .unwrap_or_default();
+
                 let points_count = count_result.map(|x| x.count).unwrap_or(0);
                 local_shards.push(LocalShardInfo {
                     shard_id,
@@ -319,7 +366,7 @@ impl Collection {
                     shard_key: shard_to_key.get(&shard_id).cloned(),
                 })
             }
-            for (peer_id, state) in replica_set.peers().into_iter() {
+            for (peer_id, state) in replica_set.peers() {
                 if peer_id == replica_set.this_peer_id() {
                     continue;
                 }
@@ -333,6 +380,7 @@ impl Collection {
         }
         let shard_transfers =
             shards_holder.get_shard_transfer_info(&*self.transfer_tasks.lock().await);
+        let resharding_operations = shards_holder.get_resharding_operations_info();
 
         // sort by shard_id
         local_shards.sort_by_key(|k| k.shard_id);
@@ -344,6 +392,7 @@ impl Collection {
             local_shards,
             remote_shards,
             shard_transfers,
+            resharding_operations,
         };
         Ok(info)
     }

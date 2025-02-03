@@ -1,7 +1,0 @@
-pytest
-requests
-grpc_requests 
-# Skip building grpcio from source
---only-binary=grpcio
-grpc-interceptor
-pyjwt

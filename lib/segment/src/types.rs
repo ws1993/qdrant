@@ -1,48 +1,61 @@
+use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fmt::{Display, Formatter};
+use std::fmt::{self, Display, Formatter};
 use std::hash::Hash;
-use std::mem::size_of;
 use std::ops::Deref;
 use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use common::types::ScoreType;
 use fnv::FnvBuildHasher;
-use geo::prelude::HaversineDistance;
-use geo::{Contains, Coord, LineString, Point, Polygon};
+use geo::{Contains, Coord, Distance as GeoDistance, Haversine, LineString, Point, Polygon};
 use indexmap::IndexSet;
 use itertools::Itertools;
+use merge::Merge;
 use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Map, Value};
 use smol_str::SmolStr;
+use strum::EnumIter;
 use uuid::Uuid;
 use validator::{Validate, ValidationError, ValidationErrors};
+use zerocopy::native_endian::U64;
 
 use crate::common::operation_error::{OperationError, OperationResult};
-use crate::common::utils::{self, MultiValue};
-use crate::data_types::integer_index::IntegerIndexParams;
-use crate::data_types::text_index::TextIndexParams;
-use crate::data_types::vectors::{VectorElementType, VectorStruct};
-use crate::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
-use crate::json_path::{JsonPath, JsonPathInterface};
+use crate::common::utils::{self, MaybeOneOrMany, MultiValue};
+use crate::data_types::index::{
+    BoolIndexParams, DatetimeIndexParams, FloatIndexParams, GeoIndexParams, IntegerIndexParams,
+    KeywordIndexParams, TextIndexParams, UuidIndexParams,
+};
+use crate::data_types::order_by::OrderValue;
+use crate::data_types::vectors::VectorStructInternal;
+use crate::index::field_index::CardinalityEstimation;
+use crate::index::sparse_index::sparse_index_config::SparseIndexConfig;
+use crate::json_path::JsonPath;
 use crate::spaces::metric::MetricPostProcessing;
 use crate::spaces::simple::{CosineMetric, DotProductMetric, EuclidMetric, ManhattanMetric};
-use crate::vector_storage::simple_sparse_vector_storage::SPARSE_VECTOR_DISTANCE;
 
 pub type PayloadKeyType = JsonPath;
 pub type PayloadKeyTypeRef<'a> = &'a JsonPath;
 /// Sequential number of modification, applied to segment
 pub type SeqNumberType = u64;
-pub type TagType = u64;
 /// Type of float point payload
 pub type FloatPayloadType = f64;
 /// Type of integer point payload
 pub type IntPayloadType = i64;
 /// Type of datetime point payload
 pub type DateTimePayloadType = DateTimeWrapper;
+/// Type of Uuid point payload
+pub type UuidPayloadType = Uuid;
+/// Type of Uuid point payload key
+pub type UuidIntType = u128;
+/// Name of a vector
+pub type VectorName = str;
+/// Name of a vector (owned variant)
+pub type VectorNameBuf = String;
 
 /// Wraps `DateTime<Utc>` to allow more flexible deserialization
 #[derive(Clone, Copy, Serialize, JsonSchema, Debug, PartialEq, PartialOrd)]
@@ -78,14 +91,32 @@ impl From<chrono::DateTime<chrono::Utc>> for DateTimeWrapper {
     }
 }
 
-pub const VECTOR_ELEMENT_SIZE: usize = size_of::<VectorElementType>();
+fn id_num_example() -> u64 {
+    42
+}
+
+fn id_uuid_example() -> String {
+    "550e8400-e29b-41d4-a716-446655440000".to_string()
+}
 
 /// Type, used for specifying point ID in user interface
 #[derive(Debug, Serialize, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, JsonSchema)]
 #[serde(untagged)]
 pub enum ExtendedPointId {
+    #[schemars(example = "id_num_example")]
     NumId(u64),
+    #[schemars(example = "id_uuid_example")]
     Uuid(Uuid),
+}
+
+impl ExtendedPointId {
+    pub fn is_num_id(&self) -> bool {
+        matches!(self, ExtendedPointId::NumId(..))
+    }
+
+    pub fn is_uuid(&self) -> bool {
+        matches!(self, ExtendedPointId::Uuid(..))
+    }
 }
 
 impl std::fmt::Display for ExtendedPointId {
@@ -124,10 +155,7 @@ impl<'de> serde::Deserialize<'de> for ExtendedPointId {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = match serde_value::Value::deserialize(deserializer) {
-            Ok(val) => val,
-            Err(err) => return Err(err),
-        };
+        let value = serde_value::Value::deserialize(deserializer)?;
 
         if let Ok(num) = value.clone().deserialize_into() {
             return Ok(ExtendedPointId::NumId(num));
@@ -147,6 +175,32 @@ impl<'de> serde::Deserialize<'de> for ExtendedPointId {
 
 /// Type of point index across all segments
 pub type PointIdType = ExtendedPointId;
+
+/// Compact representation of [`ExtendedPointId`].
+/// Unlike [`ExtendedPointId`], this type is 17 bytes long vs 24 bytes.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub enum CompactExtendedPointId {
+    NumId(U64),
+    Uuid(Uuid),
+}
+
+impl From<ExtendedPointId> for CompactExtendedPointId {
+    fn from(id: ExtendedPointId) -> Self {
+        match id {
+            ExtendedPointId::NumId(num) => CompactExtendedPointId::NumId(U64::new(num)),
+            ExtendedPointId::Uuid(uuid) => CompactExtendedPointId::Uuid(uuid),
+        }
+    }
+}
+
+impl From<CompactExtendedPointId> for ExtendedPointId {
+    fn from(id: CompactExtendedPointId) -> Self {
+        match id {
+            CompactExtendedPointId::NumId(num) => ExtendedPointId::NumId(num.get()),
+            CompactExtendedPointId::Uuid(uuid) => ExtendedPointId::Uuid(uuid),
+        }
+    }
+}
 
 /// Type of internal tags, build from payload
 #[derive(
@@ -190,6 +244,7 @@ impl Distance {
     }
 }
 
+#[derive(Debug, PartialEq)]
 pub enum Order {
     LargeBetter,
     SmallBetter,
@@ -207,16 +262,24 @@ pub struct ScoredPoint {
     /// Payload - values assigned to the point
     pub payload: Option<Payload>,
     /// Vector of the point
-    pub vector: Option<VectorStruct>,
+    pub vector: Option<VectorStructInternal>,
     /// Shard Key
     pub shard_key: Option<ShardKey>,
+    /// Order-by value
+    pub order_value: Option<OrderValue>,
 }
 
 impl Eq for ScoredPoint {}
 
 impl Ord for ScoredPoint {
+    /// Compare two scored points by score, unless they have `order_value`, in that case compare by `order_value`.
     fn cmp(&self, other: &Self) -> Ordering {
-        OrderedFloat(self.score).cmp(&OrderedFloat(other.score))
+        match (&self.order_value, &other.order_value) {
+            (None, None) => OrderedFloat(self.score).cmp(&OrderedFloat(other.score)),
+            (Some(_), None) => Ordering::Greater,
+            (None, Some(_)) => Ordering::Less,
+            (Some(self_order), Some(other_order)) => self_order.cmp(other_order),
+        }
     }
 }
 
@@ -263,17 +326,10 @@ impl PayloadIndexInfo {
                 params: None,
                 points: points_count,
             },
-            PayloadFieldSchema::FieldParams(schema_params) => match schema_params {
-                PayloadSchemaParams::Text(_) => PayloadIndexInfo {
-                    data_type: PayloadSchemaType::Text,
-                    params: Some(schema_params),
-                    points: points_count,
-                },
-                PayloadSchemaParams::Integer(_) => PayloadIndexInfo {
-                    data_type: PayloadSchemaType::Integer,
-                    params: Some(schema_params),
-                    points: points_count,
-                },
+            PayloadFieldSchema::FieldParams(schema_params) => PayloadIndexInfo {
+                data_type: schema_params.kind(),
+                params: Some(schema_params),
+                points: points_count,
             },
         }
     }
@@ -296,6 +352,11 @@ pub struct SegmentInfo {
     pub num_points: usize,
     pub num_indexed_vectors: usize,
     pub num_deleted_vectors: usize,
+    /// An ESTIMATION of effective amount of bytes used for vectors
+    /// Do NOT rely on this number unless you know what you are doing
+    pub vectors_size_bytes: usize,
+    /// An estimation of the effective amount of bytes used for payloads
+    pub payloads_size_bytes: usize,
     pub ram_usage_bytes: usize,
     pub disk_usage_bytes: usize,
     pub is_appendable: bool,
@@ -351,7 +412,7 @@ pub struct SearchParams {
 
     /// Quantization params
     #[serde(default)]
-    #[validate]
+    #[validate(nested)]
     pub quantization: Option<QuantizationSearchParams>,
 
     /// If enabled, the engine will only perform search among indexed or small segments.
@@ -359,6 +420,58 @@ pub struct SearchParams {
     /// guarantee that all uploaded vectors will be included in search results
     #[serde(default)]
     pub indexed_only: bool,
+}
+
+/// Collection default values
+#[derive(Debug, Deserialize, Validate, Clone, PartialEq, Eq)]
+pub struct CollectionConfigDefaults {
+    #[serde(default)]
+    pub vectors: Option<VectorsConfigDefaults>,
+
+    #[validate(nested)]
+    pub quantization: Option<QuantizationConfig>,
+
+    #[validate(range(min = 1))]
+    #[serde(default = "default_shard_number_const")]
+    pub shard_number: u32,
+
+    #[validate(range(min = 1))]
+    #[serde(default = "default_shard_number_per_node_const")]
+    pub shard_number_per_node: u32,
+
+    #[validate(range(min = 1))]
+    #[serde(default = "default_replication_factor_const")]
+    pub replication_factor: u32,
+
+    #[serde(default = "default_write_consistency_factor_const")]
+    #[validate(range(min = 1))]
+    pub write_consistency_factor: u32,
+
+    #[validate(nested)]
+    pub strict_mode: Option<StrictModeConfig>,
+}
+
+/// Configuration for vectors.
+#[derive(Debug, Deserialize, Validate, Clone, PartialEq, Eq)]
+pub struct VectorsConfigDefaults {
+    #[serde(default)]
+    pub on_disk: Option<bool>,
+}
+
+pub const fn default_shard_number_per_node_const() -> u32 {
+    1
+}
+
+pub const fn default_shard_number_const() -> u32 {
+    1
+}
+
+pub const fn default_replication_factor_const() -> u32 {
+    1
+}
+
+pub const fn default_write_consistency_factor_const() -> u32 {
+    1
 }
 
 /// Vector index configuration
@@ -482,7 +595,7 @@ impl ScalarQuantizationConfig {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
 pub struct ScalarQuantization {
-    #[validate]
+    #[validate(nested)]
     pub scalar: ScalarQuantizationConfig,
 }
 
@@ -508,7 +621,7 @@ impl ProductQuantizationConfig {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
 pub struct ProductQuantization {
-    #[validate]
+    #[validate(nested)]
     pub product: ProductQuantizationConfig,
 }
 
@@ -530,7 +643,7 @@ pub struct BinaryQuantizationConfig {
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Hash)]
 pub struct BinaryQuantization {
-    #[validate]
+    #[validate(nested)]
     pub binary: BinaryQuantizationConfig,
 }
 
@@ -581,6 +694,184 @@ impl From<BinaryQuantizationConfig> for QuantizationConfig {
     }
 }
 
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Merge, Hash,
+)]
+pub struct StrictModeSparse {
+    /// Max length of sparse vector
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub max_length: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Hash)]
+#[schemars(deny_unknown_fields)]
+pub struct StrictModeSparseConfig {
+    #[validate(nested)]
+    #[serde(flatten)]
+    pub config: BTreeMap<VectorNameBuf, StrictModeSparse>,
+}
+
+impl Merge for StrictModeSparseConfig {
+    fn merge(&mut self, other: Self) {
+        for (key, value) in other.config {
+            self.config.entry(key).or_default().merge(value);
+        }
+    }
+}
+
+#[derive(
+    Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Merge, Hash,
+)]
+pub struct StrictModeMultivector {
+    /// Max number of vectors in a multivector
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub max_vectors: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Hash)]
+#[schemars(deny_unknown_fields)]
+pub struct StrictModeMultivectorConfig {
+    #[validate(nested)]
+    #[serde(flatten)]
+    pub config: BTreeMap<VectorNameBuf, StrictModeMultivector>,
+}
+
+impl Merge for StrictModeMultivectorConfig {
+    fn merge(&mut self, other: Self) {
+        for (key, value) in other.config {
+            // overwrite value if key exists
+            self.config.entry(key).or_default().merge(value);
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default, Merge)]
+pub struct StrictModeConfig {
+    // Global
+    /// Whether strict mode is enabled for a collection or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Max allowed `limit` parameter for all APIs that don't have their own max limit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub max_query_limit: Option<usize>,
+
+    /// Max allowed `timeout` parameter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub max_timeout: Option<usize>,
+
+    /// Allow usage of unindexed fields in retrieval based (eg. search) filters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unindexed_filtering_retrieve: Option<bool>,
+
+    /// Allow usage of unindexed fields in filtered updates (eg. delete by payload).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unindexed_filtering_update: Option<bool>,
+
+    // Search
+    /// Max HNSW value allowed in search parameters.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_hnsw_ef: Option<usize>,
+
+    /// Whether exact search is allowed or not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_allow_exact: Option<bool>,
+
+    /// Max oversampling value allowed in search.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub search_max_oversampling: Option<f64>,
+
+    /// Max batchsize when upserting
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upsert_max_batchsize: Option<usize>,
+
+    /// Max size of a collections vector storage in bytes, ignoring replicas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_collection_vector_size_bytes: Option<usize>,
+
+    /// Max number of read operations per minute per replica
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub read_rate_limit: Option<usize>,
+
+    /// Max number of write operations per minute per replica
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(range(min = 1))]
+    pub write_rate_limit: Option<usize>,
+
+    /// Max size of a collections payload storage in bytes
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_collection_payload_size_bytes: Option<usize>,
+
+    /// Max conditions a filter can have.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_max_conditions: Option<usize>,
+
+    /// Max size of a condition, eg. items in `MatchAny`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub condition_max_size: Option<usize>,
+
+    /// Multivector configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub multivector_config: Option<StrictModeMultivectorConfig>,
+
+    /// Sparse vector configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub sparse_config: Option<StrictModeSparseConfig>,
+}
+
+impl Eq for StrictModeConfig {}
+
+impl Hash for StrictModeConfig {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        let Self {
+            enabled,
+            max_query_limit,
+            max_timeout,
+            unindexed_filtering_retrieve,
+            unindexed_filtering_update,
+            search_max_hnsw_ef,
+            search_allow_exact,
+            // We skip hashing this field because we cannot reliably hash a float
+            search_max_oversampling: _,
+            upsert_max_batchsize,
+            max_collection_vector_size_bytes,
+            read_rate_limit,
+            write_rate_limit,
+            max_collection_payload_size_bytes,
+            filter_max_conditions,
+            condition_max_size,
+            multivector_config,
+            sparse_config,
+        } = self;
+        (
+            enabled,
+            max_query_limit,
+            max_timeout,
+            unindexed_filtering_retrieve,
+            unindexed_filtering_update,
+            search_max_hnsw_ef,
+            search_allow_exact,
+            upsert_max_batchsize,
+            max_collection_vector_size_bytes,
+            (read_rate_limit, write_rate_limit),
+            (
+                max_collection_payload_size_bytes,
+                filter_max_conditions,
+                condition_max_size,
+            ),
+            (multivector_config, sparse_config),
+        )
+            .hash(state);
+    }
+}
+
 pub const DEFAULT_HNSW_EF_CONSTRUCT: usize = 100;
 
 impl Default for HnswConfig {
@@ -596,27 +887,10 @@ impl Default for HnswConfig {
     }
 }
 
-impl Indexes {
-    pub fn default_hnsw() -> Self {
-        Indexes::Hnsw(Default::default())
-    }
-}
-
 impl Default for Indexes {
     fn default() -> Self {
         Indexes::Plain {}
     }
-}
-
-/// Type of payload index
-#[derive(Default, Debug, Deserialize, Serialize, JsonSchema, Copy, Clone, PartialEq, Eq)]
-#[serde(tag = "type", content = "options", rename_all = "snake_case")]
-pub enum PayloadIndexType {
-    // Do not index anything, just keep of what should be indexed later
-    #[default]
-    Plain,
-    // Build payload index. Index is saved on disc, but index itself is in RAM
-    Struct,
 }
 
 /// Type of payload storage
@@ -624,15 +898,17 @@ pub enum PayloadIndexType {
 #[serde(tag = "type", content = "options", rename_all = "snake_case")]
 pub enum PayloadStorageType {
     // Store payload in memory and use persistence storage only if vectors are changed
-    #[default]
     InMemory,
     // Store payload on disk only, read each time it is requested
+    #[default]
     OnDisk,
+    // Store payload on disk and in memory, read from memory if possible
+    Mmap,
 }
 
 impl PayloadStorageType {
     pub fn is_on_disk(&self) -> bool {
-        matches!(self, PayloadStorageType::OnDisk)
+        matches!(self, PayloadStorageType::OnDisk | PayloadStorageType::Mmap)
     }
 }
 
@@ -640,10 +916,10 @@ impl PayloadStorageType {
 #[serde(rename_all = "snake_case")]
 pub struct SegmentConfig {
     #[serde(default)]
-    pub vector_data: HashMap<String, VectorDataConfig>,
+    pub vector_data: HashMap<VectorNameBuf, VectorDataConfig>,
     #[serde(default)]
     #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub sparse_vector_data: HashMap<String, SparseVectorDataConfig>,
+    pub sparse_vector_data: HashMap<VectorNameBuf, SparseVectorDataConfig>,
     /// Defines payload storage type
     pub payload_storage_type: PayloadStorageType,
 }
@@ -654,24 +930,10 @@ impl SegmentConfig {
     /// This grabs the quantization config for the given vector name if it exists.
     ///
     /// If no quantization is configured, `None` is returned.
-    pub fn quantization_config(&self, vector_name: &str) -> Option<&QuantizationConfig> {
+    pub fn quantization_config(&self, vector_name: &VectorName) -> Option<&QuantizationConfig> {
         self.vector_data
             .get(vector_name)
             .and_then(|v| v.quantization_config.as_ref())
-    }
-
-    pub fn distance(&self, vector_name: &str) -> Option<Distance> {
-        let distance = self
-            .vector_data
-            .get(vector_name)
-            .map(|config| config.distance);
-        if distance.is_none() {
-            self.sparse_vector_data
-                .get(vector_name)
-                .map(|_config| SPARSE_VECTOR_DISTANCE)
-        } else {
-            distance
-        }
     }
 
     /// Check if any vector storages are indexed
@@ -704,7 +966,21 @@ impl SegmentConfig {
             || self
                 .sparse_vector_data
                 .values()
-                .any(|config| config.is_index_on_disk())
+                .any(|config| config.index.index_type.is_on_disk())
+    }
+
+    pub fn is_appendable(&self) -> bool {
+        self.vector_data
+            .values()
+            .map(|vector_config| vector_config.is_appendable())
+            .chain(
+                self.sparse_vector_data
+                    .values()
+                    .map(|sparse_vector_config| {
+                        sparse_vector_config.index.index_type.is_appendable()
+                    }),
+            )
+            .all(|v| v)
     }
 }
 
@@ -724,6 +1000,11 @@ pub enum VectorStorageType {
     ///
     /// Search performance is defined by disk speed and the fraction of vectors that fit in memory.
     ChunkedMmap,
+    /// Same as `ChunkedMmap`, but vectors are forced to be locked in RAM
+    /// In this way we avoid cold requests to disk, but risk to run out of memory
+    ///
+    /// Designed as a replacement for `Memory`, which doesn't depend on RocksDB
+    InRamChunkedMmap,
 }
 
 /// Storage types for vectors
@@ -733,6 +1014,8 @@ pub enum VectorStorageDatatype {
     // Single-precision floating point
     #[default]
     Float32,
+    // Half-precision floating point
+    Float16,
     // Unsigned 8-bit integer
     Uint8,
 }
@@ -755,7 +1038,7 @@ impl VectorStorageType {
     /// Whether this storage type is a mmap on disk
     pub fn is_on_disk(&self) -> bool {
         match self {
-            Self::Memory => false,
+            Self::Memory | Self::InRamChunkedMmap => false,
             Self::Mmap | Self::ChunkedMmap => true,
         }
     }
@@ -777,7 +1060,7 @@ pub struct VectorDataConfig {
     pub quantization_config: Option<QuantizationConfig>,
     /// Vector specific configuration to enable multiple vectors per point
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub multivec_config: Option<MultiVectorConfig>,
+    pub multivector_config: Option<MultiVectorConfig>,
     /// Vector specific configuration to set specific storage element type
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub datatype: Option<VectorStorageDatatype>,
@@ -796,9 +1079,22 @@ impl VectorDataConfig {
             VectorStorageType::Memory => true,
             VectorStorageType::Mmap => false,
             VectorStorageType::ChunkedMmap => true,
+            VectorStorageType::InRamChunkedMmap => true,
         };
         is_index_appendable && is_storage_appendable
     }
+}
+
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SparseVectorStorageType {
+    /// Storage on disk
+    // (rocksdb storage)
+    OnDisk,
+    /// Storage in memory maps
+    // (blob_store storage)
+    #[default]
+    Mmap,
 }
 
 /// Config of single sparse vector data storage
@@ -807,23 +1103,20 @@ impl VectorDataConfig {
 pub struct SparseVectorDataConfig {
     /// Sparse inverted index config
     pub index: SparseIndexConfig,
+
+    /// Type of storage this sparse vector uses
+    #[serde(default = "default_sparse_vector_storage_type_when_not_in_config")]
+    pub storage_type: SparseVectorStorageType,
+}
+
+/// If the storage type is not in config, it means it is the OnDisk variant
+const fn default_sparse_vector_storage_type_when_not_in_config() -> SparseVectorStorageType {
+    SparseVectorStorageType::OnDisk
 }
 
 impl SparseVectorDataConfig {
-    pub fn is_appendable(&self) -> bool {
-        self.index.index_type == SparseIndexType::MutableRam
-    }
-
-    pub fn is_index_immutable(&self) -> bool {
-        self.index.index_type != SparseIndexType::MutableRam
-    }
-
     pub fn is_indexed(&self) -> bool {
         true
-    }
-
-    pub fn is_index_on_disk(&self) -> bool {
-        self.index.index_type == SparseIndexType::Mmap
     }
 }
 
@@ -910,7 +1203,29 @@ pub trait PayloadContainer {
     fn get_value(&self, path: &JsonPath) -> MultiValue<&Value>;
 }
 
+/// Construct a [`Payload`] value from a JSON literal.
+///
+/// Similar to [`serde_json::json!`] but only allows objects (aka maps).
+#[macro_export]
+macro_rules! payload_json {
+    ($($tt:tt)*) => {
+        match ::serde_json::json!( { $($tt)* } ) {
+            ::serde_json::Value::Object(map) => $crate::types::Payload(map),
+            _ => unreachable!(),
+        }
+    };
+}
+
+#[allow(clippy::unnecessary_wraps)] // Used as schemars example
+fn payload_example() -> Option<Payload> {
+    Some(payload_json! {
+        "city": "London",
+        "color": "green",
+    })
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema)]
+#[schemars(example = "payload_example")]
 pub struct Payload(pub Map<String, Value>);
 
 impl Payload {
@@ -918,9 +1233,8 @@ impl Payload {
         utils::merge_map(&mut self.0, &value.0)
     }
 
-    pub fn merge_by_key(&mut self, value: &Payload, key: &JsonPath) -> OperationResult<()> {
-        JsonPathInterface::value_set(Some(key), &mut self.0, &value.0);
-        Ok(())
+    pub fn merge_by_key(&mut self, value: &Payload, key: &JsonPath) {
+        JsonPath::value_set(Some(key), &mut self.0, &value.0);
     }
 
     pub fn remove(&mut self, path: &JsonPath) -> Vec<Value> {
@@ -938,10 +1252,6 @@ impl Payload {
     pub fn contains_key(&self, key: &str) -> bool {
         self.0.contains_key(key)
     }
-
-    pub fn iter(&self) -> serde_json::map::Iter {
-        self.0.iter()
-    }
 }
 
 impl PayloadContainer for Map<String, Value> {
@@ -956,7 +1266,7 @@ impl PayloadContainer for Payload {
     }
 }
 
-impl<'a> PayloadContainer for OwnedPayloadRef<'a> {
+impl PayloadContainer for OwnedPayloadRef<'_> {
     fn get_value(&self, path: &JsonPath) -> MultiValue<&Value> {
         path.value_get(self.as_ref())
     }
@@ -977,15 +1287,6 @@ impl IntoIterator for Payload {
     }
 }
 
-impl From<Value> for Payload {
-    fn from(value: Value) -> Self {
-        match value {
-            Value::Object(map) => Payload(map),
-            _ => panic!("cannot convert from {value:?}"),
-        }
-    }
-}
-
 impl From<Map<String, Value>> for Payload {
     fn from(value: serde_json::Map<String, Value>) -> Self {
         Payload(value)
@@ -998,7 +1299,7 @@ pub enum OwnedPayloadRef<'a> {
     Owned(Rc<Map<String, Value>>),
 }
 
-impl<'a> Deref for OwnedPayloadRef<'a> {
+impl Deref for OwnedPayloadRef<'_> {
     type Target = Map<String, Value>;
 
     fn deref(&self) -> &Self::Target {
@@ -1009,7 +1310,7 @@ impl<'a> Deref for OwnedPayloadRef<'a> {
     }
 }
 
-impl<'a> AsRef<Map<String, Value>> for OwnedPayloadRef<'a> {
+impl AsRef<Map<String, Value>> for OwnedPayloadRef<'_> {
     fn as_ref(&self) -> &Map<String, Value> {
         match self {
             OwnedPayloadRef::Ref(reference) => reference,
@@ -1018,13 +1319,13 @@ impl<'a> AsRef<Map<String, Value>> for OwnedPayloadRef<'a> {
     }
 }
 
-impl<'a> From<Payload> for OwnedPayloadRef<'a> {
+impl From<Payload> for OwnedPayloadRef<'_> {
     fn from(payload: Payload) -> Self {
         OwnedPayloadRef::Owned(Rc::new(payload.0))
     }
 }
 
-impl<'a> From<Map<String, Value>> for OwnedPayloadRef<'a> {
+impl From<Map<String, Value>> for OwnedPayloadRef<'_> {
     fn from(payload: Map<String, Value>) -> Self {
         OwnedPayloadRef::Owned(Rc::new(payload))
     }
@@ -1059,27 +1360,8 @@ pub enum PayloadVariant<T> {
     Value(T),
 }
 
-impl<T: Clone> PayloadVariant<T> {
-    pub fn to_list(&self) -> Vec<T> {
-        match self {
-            PayloadVariant::Value(x) => vec![x.clone()],
-            PayloadVariant::List(vec) => vec.clone(),
-        }
-    }
-}
-
-/// Json representation of a payload
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
-#[serde(untagged, rename_all = "snake_case")]
-pub enum JsonPayload {
-    Keyword(PayloadVariant<String>),
-    Integer(PayloadVariant<IntPayloadType>),
-    Float(PayloadVariant<FloatPayloadType>),
-    Geo(PayloadVariant<GeoPoint>),
-}
-
 /// All possible names of payload types
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Hash, Eq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, Copy, PartialEq, Hash, Eq, EnumIter)]
 #[serde(rename_all = "snake_case")]
 pub enum PayloadSchemaType {
     Keyword,
@@ -1089,14 +1371,102 @@ pub enum PayloadSchemaType {
     Text,
     Bool,
     Datetime,
+    Uuid,
+}
+
+impl PayloadSchemaType {
+    /// Human readable type name
+    pub fn name(&self) -> &'static str {
+        serde_variant::to_variant_name(&self).unwrap_or("unknown")
+    }
+
+    pub fn expand(&self) -> PayloadSchemaParams {
+        match self {
+            Self::Keyword => PayloadSchemaParams::Keyword(KeywordIndexParams::default()),
+            Self::Integer => PayloadSchemaParams::Integer(IntegerIndexParams::default()),
+            Self::Float => PayloadSchemaParams::Float(FloatIndexParams::default()),
+            Self::Geo => PayloadSchemaParams::Geo(GeoIndexParams::default()),
+            Self::Text => PayloadSchemaParams::Text(TextIndexParams::default()),
+            Self::Bool => PayloadSchemaParams::Bool(BoolIndexParams::default()),
+            Self::Datetime => PayloadSchemaParams::Datetime(DatetimeIndexParams::default()),
+            Self::Uuid => PayloadSchemaParams::Uuid(UuidIndexParams::default()),
+        }
+    }
 }
 
 /// Payload type with parameters
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Hash, Eq)]
 #[serde(untagged, rename_all = "snake_case")]
 pub enum PayloadSchemaParams {
-    Text(TextIndexParams),
+    Keyword(KeywordIndexParams),
     Integer(IntegerIndexParams),
+    Float(FloatIndexParams),
+    Geo(GeoIndexParams),
+    Text(TextIndexParams),
+    Bool(BoolIndexParams),
+    Datetime(DatetimeIndexParams),
+    Uuid(UuidIndexParams),
+}
+
+impl PayloadSchemaParams {
+    /// Human readable type name
+    pub fn name(&self) -> &'static str {
+        self.kind().name()
+    }
+
+    pub fn kind(&self) -> PayloadSchemaType {
+        match self {
+            PayloadSchemaParams::Keyword(_) => PayloadSchemaType::Keyword,
+            PayloadSchemaParams::Integer(_) => PayloadSchemaType::Integer,
+            PayloadSchemaParams::Float(_) => PayloadSchemaType::Float,
+            PayloadSchemaParams::Geo(_) => PayloadSchemaType::Geo,
+            PayloadSchemaParams::Text(_) => PayloadSchemaType::Text,
+            PayloadSchemaParams::Bool(_) => PayloadSchemaType::Bool,
+            PayloadSchemaParams::Datetime(_) => PayloadSchemaType::Datetime,
+            PayloadSchemaParams::Uuid(_) => PayloadSchemaType::Uuid,
+        }
+    }
+
+    pub fn tenant_optimization(&self) -> bool {
+        match self {
+            PayloadSchemaParams::Keyword(keyword) => keyword.is_tenant.unwrap_or_default(),
+            PayloadSchemaParams::Integer(integer) => integer.is_principal.unwrap_or_default(),
+            PayloadSchemaParams::Float(float) => float.is_principal.unwrap_or_default(),
+            PayloadSchemaParams::Datetime(datetime) => datetime.is_principal.unwrap_or_default(),
+            PayloadSchemaParams::Uuid(uuid) => uuid.is_tenant.unwrap_or_default(),
+            PayloadSchemaParams::Geo(_)
+            | PayloadSchemaParams::Text(_)
+            | PayloadSchemaParams::Bool(_) => false,
+        }
+    }
+
+    pub fn is_on_disk(&self) -> bool {
+        match self {
+            PayloadSchemaParams::Keyword(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Integer(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Float(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Datetime(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Uuid(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Text(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Geo(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Bool(i) => i.on_disk.unwrap_or_default(),
+        }
+    }
+
+    pub fn is_mutable(&self) -> bool {
+        let is_immutable = match self {
+            PayloadSchemaParams::Keyword(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Integer(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Float(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Datetime(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Uuid(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Text(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Geo(i) => i.on_disk.unwrap_or_default(),
+            PayloadSchemaParams::Bool(_i) => false,
+        };
+
+        !is_immutable
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Hash, Eq)]
@@ -1106,23 +1476,56 @@ pub enum PayloadFieldSchema {
     FieldParams(PayloadSchemaParams),
 }
 
-impl PayloadFieldSchema {
-    pub fn has_range_index(&self) -> bool {
+impl Display for PayloadFieldSchema {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            PayloadFieldSchema::FieldType(PayloadSchemaType::Integer)
-            | PayloadFieldSchema::FieldType(PayloadSchemaType::Datetime)
-            | PayloadFieldSchema::FieldType(PayloadSchemaType::Float) => true,
+            PayloadFieldSchema::FieldType(t) => write!(f, "{}", t.name()),
+            PayloadFieldSchema::FieldParams(p) => write!(f, "{}", p.name()),
+        }
+    }
+}
 
-            PayloadFieldSchema::FieldType(PayloadSchemaType::Bool)
-            | PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword)
-            | PayloadFieldSchema::FieldType(PayloadSchemaType::Text)
-            | PayloadFieldSchema::FieldType(PayloadSchemaType::Geo)
-            | PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(_)) => false,
+impl PayloadFieldSchema {
+    pub fn expand(&self) -> Cow<'_, PayloadSchemaParams> {
+        match self {
+            PayloadFieldSchema::FieldType(t) => Cow::Owned(t.expand()),
+            PayloadFieldSchema::FieldParams(p) => Cow::Borrowed(p),
+        }
+    }
 
-            PayloadFieldSchema::FieldParams(PayloadSchemaParams::Integer(IntegerIndexParams {
-                range,
-                ..
-            })) => *range,
+    /// Human readable type name
+    pub fn name(&self) -> &'static str {
+        match self {
+            PayloadFieldSchema::FieldType(field_type) => field_type.name(),
+            PayloadFieldSchema::FieldParams(field_params) => field_params.name(),
+        }
+    }
+
+    pub fn is_tenant(&self) -> bool {
+        match self {
+            PayloadFieldSchema::FieldType(_) => false,
+            PayloadFieldSchema::FieldParams(params) => params.tenant_optimization(),
+        }
+    }
+
+    pub fn is_on_disk(&self) -> bool {
+        match self {
+            PayloadFieldSchema::FieldType(_) => false,
+            PayloadFieldSchema::FieldParams(params) => params.is_on_disk(),
+        }
+    }
+
+    pub fn is_mutable(&self) -> bool {
+        match self {
+            PayloadFieldSchema::FieldType(_) => true,
+            PayloadFieldSchema::FieldParams(params) => params.is_mutable(),
+        }
+    }
+
+    pub fn kind(&self) -> PayloadSchemaType {
+        match self {
+            PayloadFieldSchema::FieldType(t) => *t,
+            PayloadFieldSchema::FieldParams(p) => p.kind(),
         }
     }
 }
@@ -1137,20 +1540,15 @@ impl TryFrom<PayloadIndexInfo> for PayloadFieldSchema {
     type Error = String;
 
     fn try_from(index_info: PayloadIndexInfo) -> Result<Self, Self::Error> {
-        let Some(params) = index_info.params else {
-            return Ok(PayloadFieldSchema::FieldType(index_info.data_type));
-        };
-
-        match (index_info.data_type, params) {
-            (PayloadSchemaType::Text, PayloadSchemaParams::Text(params)) => Ok(
-                PayloadFieldSchema::FieldParams(PayloadSchemaParams::Text(params)),
-            ),
-            (PayloadSchemaType::Integer, PayloadSchemaParams::Integer(params)) => Ok(
-                PayloadFieldSchema::FieldParams(PayloadSchemaParams::Integer(params)),
-            ),
-            (data_type, PayloadSchemaParams::Integer(_) | PayloadSchemaParams::Text(_)) => Err(
-                format!("Payload field with type {data_type:?} has unexpected params"),
-            ),
+        match index_info.params {
+            Some(params) if params.kind() == index_info.data_type => {
+                Ok(PayloadFieldSchema::FieldParams(params))
+            }
+            Some(_) => Err(format!(
+                "Payload field with type {:?} has unexpected params",
+                index_info.data_type,
+            )),
+            None => Ok(PayloadFieldSchema::FieldType(index_info.data_type)),
         }
     }
 }
@@ -1204,7 +1602,7 @@ where
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum ValueVariants {
-    Keyword(String),
+    String(String),
     Integer(IntPayloadType),
     Bool(bool),
 }
@@ -1212,7 +1610,7 @@ pub enum ValueVariants {
 impl ValueVariants {
     pub fn to_value(&self) -> Value {
         match self {
-            ValueVariants::Keyword(keyword) => Value::String(keyword.clone()),
+            ValueVariants::String(keyword) => Value::String(keyword.clone()),
             &ValueVariants::Integer(integer) => Value::Number(integer.into()),
             &ValueVariants::Bool(flag) => Value::Bool(flag),
         }
@@ -1222,8 +1620,24 @@ impl ValueVariants {
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum AnyVariants {
-    Keywords(IndexSet<String, FnvBuildHasher>),
+    Strings(IndexSet<String, FnvBuildHasher>),
     Integers(IndexSet<IntPayloadType, FnvBuildHasher>),
+}
+
+impl AnyVariants {
+    pub fn len(&self) -> usize {
+        match self {
+            AnyVariants::Strings(index_set) => index_set.len(),
+            AnyVariants::Integers(index_set) => index_set.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        match self {
+            AnyVariants::Strings(index_set) => index_set.is_empty(),
+            AnyVariants::Integers(index_set) => index_set.is_empty(),
+        }
+    }
 }
 
 /// Exact match of the given value
@@ -1328,7 +1742,7 @@ impl From<bool> for Match {
 impl From<String> for Match {
     fn from(keyword: String) -> Self {
         Self::Value(MatchValue {
-            value: ValueVariants::Keyword(keyword),
+            value: ValueVariants::String(keyword),
         })
     }
 }
@@ -1336,7 +1750,7 @@ impl From<String> for Match {
 impl From<SmolStr> for Match {
     fn from(keyword: SmolStr) -> Self {
         Self::Value(MatchValue {
-            value: ValueVariants::Keyword(keyword.into()),
+            value: ValueVariants::String(keyword.into()),
         })
     }
 }
@@ -1353,8 +1767,14 @@ impl From<Vec<String>> for Match {
     fn from(keywords: Vec<String>) -> Self {
         let keywords: IndexSet<String, FnvBuildHasher> = keywords.into_iter().collect();
         Self::Any(MatchAny {
-            any: AnyVariants::Keywords(keywords),
+            any: AnyVariants::Strings(keywords),
         })
+    }
+}
+
+impl From<ValueVariants> for Match {
+    fn from(value: ValueVariants) -> Self {
+        Self::Value(MatchValue { value })
     }
 }
 
@@ -1362,7 +1782,7 @@ impl From<Vec<String>> for MatchExcept {
     fn from(keywords: Vec<String>) -> Self {
         let keywords: IndexSet<String, FnvBuildHasher> = keywords.into_iter().collect();
         MatchExcept {
-            except: AnyVariants::Keywords(keywords),
+            except: AnyVariants::Strings(keywords),
         }
     }
 }
@@ -1476,17 +1896,21 @@ pub struct ValuesCount {
 }
 
 impl ValuesCount {
-    pub fn check_count(&self, value: &Value) -> bool {
+    pub fn check_count(&self, count: usize) -> bool {
+        self.lt.map_or(true, |x| count < x)
+            && self.gt.map_or(true, |x| count > x)
+            && self.lte.map_or(true, |x| count <= x)
+            && self.gte.map_or(true, |x| count >= x)
+    }
+
+    pub fn check_count_from(&self, value: &Value) -> bool {
         let count = match value {
             Value::Null => 0,
             Value::Array(array) => array.len(),
             _ => 1,
         };
 
-        self.lt.map_or(true, |x| count < x)
-            && self.gt.map_or(true, |x| count > x)
-            && self.lte.map_or(true, |x| count <= x)
-            && self.gte.map_or(true, |x| count >= x)
+        self.check_count(count)
     }
 }
 
@@ -1532,7 +1956,7 @@ pub struct GeoRadius {
 impl GeoRadius {
     pub fn check_point(&self, point: &GeoPoint) -> bool {
         let query_center = Point::new(self.center.lon, self.center.lat);
-        query_center.haversine_distance(&Point::new(point.lon, point.lat)) < self.radius
+        Haversine::distance(query_center, Point::new(point.lon, point.lat)) < self.radius
     }
 }
 
@@ -1621,19 +2045,6 @@ impl GeoPolygon {
         PolygonWrapper {
             polygon: Polygon::new(exterior_line, interior_lines),
         }
-    }
-
-    pub fn new(exterior: &GeoLineString, interiors: &Vec<GeoLineString>) -> OperationResult<Self> {
-        Self::validate_line_string(exterior)?;
-
-        for interior in interiors {
-            Self::validate_line_string(interior)?;
-        }
-
-        Ok(GeoPolygon {
-            exterior: exterior.clone(),
-            interiors: Some(interiors.to_vec()),
-        })
     }
 }
 
@@ -1776,6 +2187,19 @@ impl FieldCondition {
             }
         )
     }
+
+    fn input_size(&self) -> usize {
+        if self.r#match.is_none() {
+            return 0;
+        }
+
+        match self.r#match.as_ref().unwrap() {
+            Match::Any(match_any) => match_any.any.len(),
+            Match::Except(match_except) => match_except.except.len(),
+            Match::Value(_) => 0,
+            Match::Text(_) => 0,
+        }
+    }
 }
 
 pub fn validate_field_condition(field_condition: &FieldCondition) -> Result<(), ValidationError> {
@@ -1829,9 +2253,29 @@ pub struct HasIdCondition {
     pub has_id: HashSet<PointIdType>,
 }
 
+/// Filter points which have specific vector assigned
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
+pub struct HasVectorCondition {
+    pub has_vector: VectorNameBuf,
+}
+
+impl From<VectorNameBuf> for HasVectorCondition {
+    fn from(vector: VectorNameBuf) -> Self {
+        HasVectorCondition { has_vector: vector }
+    }
+}
+
 impl From<HashSet<PointIdType>> for HasIdCondition {
     fn from(set: HashSet<PointIdType>) -> Self {
         HasIdCondition { has_id: set }
+    }
+}
+
+impl FromIterator<PointIdType> for HasIdCondition {
+    fn from_iter<T: IntoIterator<Item = PointIdType>>(iter: T) -> Self {
+        HasIdCondition {
+            has_id: iter.into_iter().collect(),
+        }
     }
 }
 
@@ -1839,13 +2283,13 @@ impl From<HashSet<PointIdType>> for HasIdCondition {
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Validate)]
 pub struct Nested {
     pub key: PayloadKeyType,
-    #[validate]
+    #[validate(nested)]
     pub filter: Filter,
 }
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Validate)]
 pub struct NestedCondition {
-    #[validate]
+    #[validate(nested)]
     pub nested: Nested,
 }
 
@@ -1870,8 +2314,11 @@ impl NestedCondition {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema)]
 #[serde(untagged)]
+#[serde(
+    expecting = "Expected some form of condition, which can be a field condition (like {\"key\": ..., \"match\": ... }), or some other mentioned in the documentation: https://qdrant.tech/documentation/concepts/filtering/#filtering-conditions"
+)]
 #[allow(clippy::large_enum_variant)]
 pub enum Condition {
     /// Check if field satisfies provided condition
@@ -1882,10 +2329,31 @@ pub enum Condition {
     IsNull(IsNullCondition),
     /// Check if points id is in a given set
     HasId(HasIdCondition),
+    /// Check if point has vector assigned
+    HasVector(HasVectorCondition),
     /// Nested filters
     Nested(NestedCondition),
     /// Nested filter
     Filter(Filter),
+
+    #[serde(skip)]
+    CustomIdChecker(Arc<dyn CustomIdCheckerCondition + Send + Sync + 'static>),
+}
+
+impl PartialEq for Condition {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Field(this), Self::Field(other)) => this == other,
+            (Self::IsEmpty(this), Self::IsEmpty(other)) => this == other,
+            (Self::IsNull(this), Self::IsNull(other)) => this == other,
+            (Self::HasId(this), Self::HasId(other)) => this == other,
+            (Self::HasVector(this), Self::HasVector(other)) => this == other,
+            (Self::Nested(this), Self::Nested(other)) => this == other,
+            (Self::Filter(this), Self::Filter(other)) => this == other,
+            (Self::CustomIdChecker(_), Self::CustomIdChecker(_)) => false,
+            _ => false,
+        }
+    }
 }
 
 impl Condition {
@@ -1894,23 +2362,63 @@ impl Condition {
             nested: Nested { key, filter },
         })
     }
+
+    pub fn size_estimation(&self) -> usize {
+        match self {
+            Condition::Field(field_condition) => field_condition.input_size(),
+            Condition::HasId(has_id_condition) => has_id_condition.has_id.len(),
+            Condition::Filter(filter) => filter.max_condition_input_size(),
+            Condition::Nested(nested) => nested.filter().max_condition_input_size(),
+            Condition::IsEmpty(_)
+            | Condition::IsNull(_)
+            | Condition::HasVector(_)
+            | Condition::CustomIdChecker(_) => 0,
+        }
+    }
+
+    pub fn sub_conditions_count(&self) -> usize {
+        match self {
+            Condition::Nested(nested_condition) => {
+                nested_condition.filter().total_conditions_count()
+            }
+            Condition::Filter(filter) => filter.total_conditions_count(),
+            Condition::Field(_)
+            | Condition::IsEmpty(_)
+            | Condition::IsNull(_)
+            | Condition::CustomIdChecker(_)
+            | Condition::HasId(_)
+            | Condition::HasVector(_) => 0,
+        }
+    }
 }
 
 // The validator crate does not support deriving for enums.
 impl Validate for Condition {
     fn validate(&self) -> Result<(), ValidationErrors> {
         match self {
-            Condition::HasId(_) | Condition::IsEmpty(_) | Condition::IsNull(_) => Ok(()),
+            Condition::HasId(_)
+            | Condition::IsEmpty(_)
+            | Condition::IsNull(_)
+            | Condition::HasVector(_) => Ok(()),
             Condition::Field(field_condition) => field_condition.validate(),
             Condition::Nested(nested_condition) => nested_condition.validate(),
             Condition::Filter(filter) => filter.validate(),
+            Condition::CustomIdChecker(_) => Ok(()),
         }
     }
+}
+
+pub trait CustomIdCheckerCondition: fmt::Debug {
+    fn estimate_cardinality(&self, points: usize) -> CardinalityEstimation;
+    fn check(&self, point_id: ExtendedPointId) -> bool;
 }
 
 /// Options for specifying which payload to include or not
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq)]
 #[serde(untagged, rename_all = "snake_case")]
+#[serde(
+    expecting = "Expected a boolean, an array of strings, or an object with an include/exclude field"
+)]
 pub enum WithPayloadInterface {
     /// If `true` - return all payload,
     /// If `false` - do not return payload
@@ -1927,15 +2435,22 @@ impl From<bool> for WithPayloadInterface {
     }
 }
 
+impl Default for WithPayloadInterface {
+    fn default() -> Self {
+        WithPayloadInterface::Bool(false)
+    }
+}
+
 /// Options for specifying which vector to include
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq)]
 #[serde(untagged, rename_all = "snake_case")]
+#[serde(expecting = "Expected a boolean, or an array of strings")]
 pub enum WithVector {
     /// If `true` - return all vector,
     /// If `false` - do not return vector
     Bool(bool),
     /// Specify which vector to return
-    Selector(Vec<String>),
+    Selector(Vec<VectorNameBuf>),
 }
 
 impl WithVector {
@@ -2094,29 +2609,26 @@ pub struct MinShould {
     pub min_count: usize,
 }
 
-impl MinShould {
-    pub fn new_min_should(condition: Condition, min_count: usize) -> Self {
-        MinShould {
-            conditions: vec![condition],
-            min_count,
-        }
-    }
-}
-
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Default)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub struct Filter {
     /// At least one of those conditions should match
-    #[validate]
+    #[validate(nested)]
+    #[serde(default, with = "MaybeOneOrMany")]
+    #[schemars(with = "MaybeOneOrMany<Condition>")]
     pub should: Option<Vec<Condition>>,
     /// At least minimum amount of given conditions should match
-    #[validate]
+    #[validate(nested)]
     pub min_should: Option<MinShould>,
     /// All conditions must match
-    #[validate]
+    #[validate(nested)]
+    #[serde(default, with = "MaybeOneOrMany")]
+    #[schemars(with = "MaybeOneOrMany<Condition>")]
     pub must: Option<Vec<Condition>>,
     /// All conditions must NOT match
-    #[validate]
+    #[validate(nested)]
+    #[serde(default, with = "MaybeOneOrMany")]
+    #[schemars(with = "MaybeOneOrMany<Condition>")]
     pub must_not: Option<Vec<Condition>>,
 }
 
@@ -2194,6 +2706,113 @@ impl Filter {
             must_not: merge_component(self.must_not, other.must_not),
         }
     }
+
+    pub fn merge_opts(this: Option<Self>, other: Option<Self>) -> Option<Self> {
+        match (this, other) {
+            (None, None) => None,
+            (Some(this), None) => Some(this),
+            (None, Some(other)) => Some(other),
+            (Some(this), Some(other)) => Some(this.merge_owned(other)),
+        }
+    }
+
+    pub fn iter_conditions(&self) -> impl Iterator<Item = &Condition> {
+        self.must
+            .iter()
+            .flatten()
+            .chain(self.must_not.iter().flatten())
+            .chain(self.should.iter().flatten())
+            .chain(self.min_should.iter().flat_map(|i| &i.conditions))
+    }
+
+    /// Returns the total amount of conditions of the filter, including all nested filter.
+    pub fn total_conditions_count(&self) -> usize {
+        fn count_all_conditions(field: Option<&Vec<Condition>>) -> usize {
+            field
+                .map(|i| i.len() + i.iter().map(|j| j.sub_conditions_count()).sum::<usize>())
+                .unwrap_or(0)
+        }
+
+        count_all_conditions(self.should.as_ref())
+            + count_all_conditions(self.min_should.as_ref().map(|i| &i.conditions))
+            + count_all_conditions(self.must.as_ref())
+            + count_all_conditions(self.must_not.as_ref())
+    }
+
+    /// Returns the size of the largest condition.
+    pub fn max_condition_input_size(&self) -> usize {
+        self.iter_conditions()
+            .map(|i| i.size_estimation())
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SnapshotFormat {
+    /// Created by Qdrant `<0.11.0`.
+    ///
+    /// The collection snapshot contains nested tar archives for segments.
+    /// Segment tar archives contain a plain copy of the segment directory.
+    ///
+    /// ```plaintext
+    /// ./0/segments/
+    /// ├── 0b31e274-dc65-40e4-8493-67ebed4bcf10.tar
+    /// │   ├── segment.json
+    /// │   ├── CURRENT
+    /// │   ├── 000009.sst
+    /// │   ├── 000010.sst
+    /// │   └── …
+    /// ├── 1d6c96ec-7965-491a-9c45-362d55361e9b.tar
+    /// └── …
+    /// ```
+    Ancient,
+    /// Qdrant `>=0.11.0` `<=1.13` (and maybe even later).
+    ///
+    /// The collection snapshot contains nested tar archives for segments.
+    /// Distinguished by a single top-level directory `snapshot` in each segment
+    /// tar archive. RocksDB data stored as backups and requires unpacking
+    /// procedure.
+    ///
+    /// ```plaintext
+    /// ./0/segments/
+    /// ├── 0b31e274-dc65-40e4-8493-67ebed4bcf10.tar
+    /// │   └── snapshot/                               # single top-level dir
+    /// │       ├── db_backup/                          # rockdb backup
+    /// │       │   ├── meta/
+    /// │       │   ├── private/
+    /// │       │   └── shared_checksum/
+    /// │       ├── payload_index_db_backup             # rocksdb backup
+    /// │       │   ├── meta/
+    /// │       │   ├── private/
+    /// │       │   └── shared_checksum/
+    /// │       └── files/                              # regular files
+    /// │           ├── segment.json
+    /// │           └── …
+    /// ├── 1d6c96ec-7965-491a-9c45-362d55361e9b.tar
+    /// └── …
+    /// ```
+    Regular,
+    /// New experimental format.
+    ///
+    /// ```plaintext
+    /// ./0/segments/
+    /// ├── 0b31e274-dc65-40e4-8493-67ebed4bcf10/
+    /// │   ├── db_backup/                              # rockdb backup
+    /// │   │   ├── meta/
+    /// │   │   ├── private/
+    /// │   │   └── shared_checksum/
+    /// │   ├── payload_index_db_backup                 # rocksdb backup
+    /// │   │   ├── meta/
+    /// │   │   ├── private/
+    /// │   │   └── shared_checksum/
+    /// │   └── files/                                  # regular files
+    /// │       ├── segment.json
+    /// │       └── …
+    /// ├── 1d6c96ec-7965-491a-9c45-362d55361e9b/
+    /// └── …
+    /// ```
+    Streamable,
 }
 
 #[cfg(test)]
@@ -2249,12 +2868,9 @@ mod tests {
     use rstest::rstest;
     use serde::de::DeserializeOwned;
     use serde_json;
-    use serde_json::json;
 
     use super::test_utils::build_polygon_with_interiors;
     use super::*;
-    use crate::common::utils::check_is_empty;
-    use crate::json_path::{path, JsonPathString};
 
     #[allow(dead_code)]
     fn check_rms_serialization<T: Serialize + DeserializeOwned + PartialEq + std::fmt::Debug>(
@@ -2269,7 +2885,7 @@ mod tests {
     #[test]
     #[ignore]
     fn test_rmp_vs_cbor_deserialize() {
-        let payload: Payload = json!({"payload_key":"payload_value"}).into();
+        let payload = payload_json! {"payload_key": "payload_value"};
         let raw = rmp_serde::to_vec(&payload).unwrap();
         let de_record: Payload = serde_cbor::from_slice(&raw).unwrap();
         eprintln!("payload = {payload:#?}");
@@ -2476,7 +3092,7 @@ mod tests {
     fn test_serialize_query() {
         let filter = Filter {
             must: Some(vec![Condition::Field(FieldCondition::new_match(
-                path("hello"),
+                JsonPath::new("hello"),
                 "world".to_owned().into(),
             ))]),
             must_not: None,
@@ -2540,7 +3156,7 @@ mod tests {
         assert_eq!(
             condition.r#match.unwrap(),
             Match::Value(MatchValue {
-                value: ValueVariants::Keyword("world".to_owned())
+                value: ValueVariants::String("world".to_owned())
             })
         );
     }
@@ -2568,24 +3184,21 @@ mod tests {
         let should = filter.should.unwrap();
 
         assert_eq!(should.len(), 1);
-        let c = match should.first() {
-            Some(Condition::Field(c)) => c,
-            _ => panic!("Condition::Field expected"),
+        let Some(Condition::Field(c)) = should.first() else {
+            panic!("Condition::Field expected")
         };
 
         assert_eq!(c.key.to_string(), "Jason");
 
-        let m = match c.r#match.as_ref().unwrap() {
-            Match::Any(m) => m,
-            _ => panic!("Match::Any expected"),
+        let Match::Any(m) = c.r#match.as_ref().unwrap() else {
+            panic!("Match::Any expected")
         };
-        if let AnyVariants::Keywords(kws) = &m.any {
+        if let AnyVariants::Strings(kws) = &m.any {
             assert_eq!(kws.len(), 3);
-            let expect: IndexSet<_, FnvBuildHasher> = IndexSet::from_iter(
-                ["Bourne", "Momoa", "Statham"]
-                    .into_iter()
-                    .map(|i| i.to_string()),
-            );
+            let expect: IndexSet<_, FnvBuildHasher> = ["Bourne", "Momoa", "Statham"]
+                .into_iter()
+                .map(|i| i.to_string())
+                .collect();
             assert_eq!(kws, &expect);
         } else {
             panic!("AnyVariants::Keywords expected");
@@ -2655,7 +3268,7 @@ mod tests {
         assert_eq!(
             condition.r#match.unwrap(),
             Match::Value(MatchValue {
-                value: ValueVariants::Keyword("world".to_owned())
+                value: ValueVariants::String("world".to_owned())
             })
         );
     }
@@ -2678,9 +3291,8 @@ mod tests {
         let should = filter.should.unwrap();
 
         assert_eq!(should.len(), 1);
-        let c = match should.first() {
-            Some(Condition::IsEmpty(c)) => c,
-            _ => panic!("Condition::IsEmpty expected"),
+        let Some(Condition::IsEmpty(c)) = should.first() else {
+            panic!("Condition::IsEmpty expected")
         };
 
         assert_eq!(c.is_empty.key.to_string(), "Jason");
@@ -2704,9 +3316,8 @@ mod tests {
         let should = filter.should.unwrap();
 
         assert_eq!(should.len(), 1);
-        let c = match should.first() {
-            Some(Condition::IsNull(c)) => c,
-            _ => panic!("Condition::IsNull expected"),
+        let Some(Condition::IsNull(c)) = should.first() else {
+            panic!("Condition::IsNull expected")
         };
 
         assert_eq!(c.is_null.key.to_string(), "Jason");
@@ -2768,8 +3379,51 @@ mod tests {
                     _ => panic!("Condition::Field expected"),
                 }
             }
-            o => panic!("Condition::Nested expected but got {:?}", o),
+            o => panic!("Condition::Nested expected but got {o:?}"),
         };
+    }
+
+    #[test]
+    fn test_parse_single_nested_filter_query() {
+        let query = r#"
+        {
+          "must": {
+              "nested": {
+                "key": "country.cities",
+                "filter": {
+                  "must": {
+                      "key": "population",
+                      "range": {
+                        "gte": 8
+                      }
+                    }
+                }
+              }
+            }
+        }
+        "#;
+        let filter: Filter = serde_json::from_str(query).unwrap();
+        let musts = filter.must.unwrap();
+        assert_eq!(musts.len(), 1);
+
+        let first_must = musts.first().unwrap();
+        let Condition::Nested(nested_condition) = first_must else {
+            panic!("Condition::Nested expected but got {first_must:?}")
+        };
+
+        assert_eq!(nested_condition.raw_key().to_string(), "country.cities");
+        assert_eq!(nested_condition.array_key().to_string(), "country.cities[]");
+
+        let nested_must = nested_condition.filter().must.as_ref().unwrap();
+        assert_eq!(nested_must.len(), 1);
+
+        let must = nested_must.first().unwrap();
+        let Condition::Field(c) = must else {
+            panic!("Condition::Field expected, got {must:?}")
+        };
+
+        assert_eq!(c.key.to_string(), "population");
+        assert!(c.range.is_some());
     }
 
     #[test]
@@ -3073,117 +3727,6 @@ mod tests {
     }
 
     #[test]
-    fn test_remove_key() {
-        test_remove_key_impl::<JsonPathString>();
-        // TODO: test_remove_key_impl::<JsonPathV2>();
-    }
-
-    fn test_remove_key_impl<P: JsonPathInterface>() {
-        let mut payload: serde_json::Map<String, Value> = serde_json::from_str(
-            r#"
-        {
-            "a": 1,
-            "b": {
-                "c": 123,
-                "e": {
-                    "f": [1,2,3],
-                    "g": 7,
-                    "h": "text",
-                    "i": [
-                        {
-                            "j": 1,
-                            "k": 2
-
-                        },
-                        {
-                            "j": 3,
-                            "k": 4
-                        }
-                    ]
-                }
-            }
-        }
-        "#,
-        )
-        .unwrap();
-        let removed = path::<P>("b.c").value_remove(&mut payload).into_vec();
-        assert_eq!(removed, vec![Value::Number(123.into())]);
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("b.e.f[1]").value_remove(&mut payload).into_vec();
-        assert_eq!(removed, vec![Value::Number(2.into())]);
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("b.e.i[0].j")
-            .value_remove(&mut payload)
-            .into_vec();
-        assert_eq!(removed, vec![Value::Number(1.into())]);
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("b.e.i[].k").value_remove(&mut payload).into_vec();
-        assert_eq!(
-            removed,
-            vec![Value::Number(2.into()), Value::Number(4.into())]
-        );
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("b.e.i[]").value_remove(&mut payload).into_vec();
-        assert_eq!(
-            removed,
-            vec![Value::Array(vec![
-                Value::Object(serde_json::Map::from_iter(vec![])),
-                Value::Object(serde_json::Map::from_iter(vec![(
-                    "j".to_string(),
-                    Value::Number(3.into())
-                ),])),
-            ])]
-        );
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("b.e.i").value_remove(&mut payload).into_vec();
-        assert_eq!(removed, vec![Value::Array(vec![])]);
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("b.e.f").value_remove(&mut payload).into_vec();
-        assert_eq!(removed, vec![Value::Array(vec![1.into(), 3.into()])]);
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("k").value_remove(&mut payload);
-        assert!(check_is_empty(&removed));
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("").value_remove(&mut payload);
-        assert!(check_is_empty(&removed));
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("b.e.l").value_remove(&mut payload);
-        assert!(check_is_empty(&removed));
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("a").value_remove(&mut payload).into_vec();
-        assert_eq!(removed, vec![Value::Number(1.into())]);
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("b.e").value_remove(&mut payload).into_vec();
-        assert_eq!(
-            removed,
-            vec![Value::Object(serde_json::Map::from_iter(vec![
-                // ("f".to_string(), Value::Array(vec![1.into(), 2.into(), 3.into()])), has been removed
-                ("g".to_string(), Value::Number(7.into())),
-                ("h".to_string(), Value::String("text".to_owned())),
-            ]))]
-        );
-        assert_ne!(payload, Default::default());
-
-        let removed = path::<P>("b").value_remove(&mut payload).into_vec();
-        assert_eq!(
-            removed,
-            vec![Value::Object(serde_json::Map::from_iter(vec![]))]
-        ); // empty object left
-        assert_eq!(payload, Default::default());
-    }
-
-    #[test]
     fn test_payload_parsing() {
         let ft = PayloadFieldSchema::FieldType(PayloadSchemaType::Keyword);
         let ft_json = serde_json::to_string(&ft).unwrap();
@@ -3201,15 +3744,15 @@ mod tests {
     #[test]
     fn merge_filters() {
         let condition1 = Condition::Field(FieldCondition::new_match(
-            path("summary"),
+            JsonPath::new("summary"),
             Match::new_text("Berlin"),
         ));
         let mut this = Filter::new_must(condition1.clone());
         this.should = Some(vec![condition1.clone()]);
 
         let condition2 = Condition::Field(FieldCondition::new_match(
-            path("city"),
-            Match::new_value(ValueVariants::Keyword("Osaka".into())),
+            JsonPath::new("city"),
+            Match::new_value(ValueVariants::String("Osaka".into())),
         ));
         let other = Filter::new_must(condition2.clone());
 
@@ -3228,7 +3771,7 @@ mod tests {
 
     #[test]
     fn test_payload_selector_include() {
-        let payload = json!({
+        let payload = payload_json! {
             "a": 1,
             "b": {
                 "c": 123,
@@ -3249,54 +3792,55 @@ mod tests {
                     ]
                 }
             }
-        });
+        };
 
         // include root & nested
-        let selector = PayloadSelector::new_include(vec![path("a"), path("b.e.f")]);
-        let payload = selector.process(payload.into());
+        let selector =
+            PayloadSelector::new_include(vec![JsonPath::new("a"), JsonPath::new("b.e.f")]);
+        let payload = selector.process(payload);
 
-        let expected = json!({
+        let expected = payload_json! {
             "a": 1,
             "b": {
                 "e": {
                     "f": [1,2,3],
                 }
             }
-        });
-        assert_eq!(payload, expected.into());
+        };
+        assert_eq!(payload, expected);
     }
 
     #[test]
     fn test_payload_selector_array_include() {
-        let payload = json!({
+        let payload = payload_json! {
             "a": 1,
             "b": {
                 "c": 123,
                 "f": [1,2,3,4,5],
             }
-        });
+        };
 
         // handles duplicates
-        let selector = PayloadSelector::new_include(vec![path("a"), path("a")]);
-        let payload = selector.process(payload.into());
+        let selector = PayloadSelector::new_include(vec![JsonPath::new("a"), JsonPath::new("a")]);
+        let payload = selector.process(payload);
 
-        let expected = json!({
+        let expected = payload_json! {
             "a": 1
-        });
-        assert_eq!(payload, expected.into());
+        };
+        assert_eq!(payload, expected);
 
         // ignore path that points to array
-        let selector = PayloadSelector::new_include(vec![path("b.f[0]")]);
+        let selector = PayloadSelector::new_include(vec![JsonPath::new("b.f[0]")]);
         let payload = selector.process(payload);
 
         // nothing included
-        let expected = json!({});
-        assert_eq!(payload, expected.into());
+        let expected = payload_json! {};
+        assert_eq!(payload, expected);
     }
 
     #[test]
     fn test_payload_selector_no_implicit_array_include() {
-        let payload = json!({
+        let payload = payload_json! {
             "a": 1,
             "b": {
                 "c": [
@@ -3310,12 +3854,12 @@ mod tests {
                     }
                 ],
             }
-        });
+        };
 
-        let selector = PayloadSelector::new_include(vec![path("b.c")]);
-        let selected_payload = selector.process(payload.clone().into());
+        let selector = PayloadSelector::new_include(vec![JsonPath::new("b.c")]);
+        let selected_payload = selector.process(payload.clone());
 
-        let expected = json!({
+        let expected = payload_json! {
             "b": {
                 "c": [
                     {
@@ -3328,38 +3872,38 @@ mod tests {
                     }
                 ]
             }
-        });
-        assert_eq!(selected_payload, expected.into());
+        };
+        assert_eq!(selected_payload, expected);
 
         // with explicit array traversal ([] notation)
-        let selector = PayloadSelector::new_include(vec![path("b.c[].d")]);
-        let selected_payload = selector.process(payload.clone().into());
+        let selector = PayloadSelector::new_include(vec![JsonPath::new("b.c[].d")]);
+        let selected_payload = selector.process(payload.clone());
 
-        let expected = json!({
+        let expected = payload_json! {
             "b": {
                 "c": [
                     {"d": 1},
                     {"d": 3}
                 ]
             }
-        });
-        assert_eq!(selected_payload, expected.into());
+        };
+        assert_eq!(selected_payload, expected);
 
         // shortcuts implicit array traversal
-        let selector = PayloadSelector::new_include(vec![path("b.c.d")]);
-        let selected_payload = selector.process(payload.into());
+        let selector = PayloadSelector::new_include(vec![JsonPath::new("b.c.d")]);
+        let selected_payload = selector.process(payload);
 
-        let expected = json!({
+        let expected = payload_json! {
             "b": {
                 "c": []
             }
-        });
-        assert_eq!(selected_payload, expected.into());
+        };
+        assert_eq!(selected_payload, expected);
     }
 
     #[test]
     fn test_payload_selector_exclude() {
-        let payload = json!({
+        let payload = payload_json! {
             "a": 1,
             "b": {
                 "c": 123,
@@ -3380,14 +3924,15 @@ mod tests {
                     ]
                 }
             }
-        });
+        };
 
         // exclude
-        let selector = PayloadSelector::new_exclude(vec![path("a"), path("b.e.f")]);
-        let payload = selector.process(payload.into());
+        let selector =
+            PayloadSelector::new_exclude(vec![JsonPath::new("a"), JsonPath::new("b.e.f")]);
+        let payload = selector.process(payload);
 
         // root removal & nested removal
-        let expected = json!({
+        let expected = payload_json! {
             "b": {
                 "c": 123,
                 "e": {
@@ -3406,55 +3951,63 @@ mod tests {
                     ]
                 }
             }
-        });
-        assert_eq!(payload, expected.into());
+        };
+        assert_eq!(payload, expected);
     }
 
     #[test]
     fn test_payload_selector_array_exclude() {
-        let payload = json!({
+        let payload = payload_json! {
             "a": 1,
             "b": {
                 "c": 123,
                 "f": [1,2,3,4,5],
             }
-        });
+        };
 
         // handles duplicates
-        let selector = PayloadSelector::new_exclude(vec![path("a"), path("a")]);
-        let payload = selector.process(payload.into());
+        let selector = PayloadSelector::new_exclude(vec![JsonPath::new("a"), JsonPath::new("a")]);
+        let payload = selector.process(payload);
 
         // single removal
-        let expected = json!({
+        let expected = payload_json! {
             "b": {
                 "c": 123,
                 "f": [1,2,3,4,5],
             }
-        });
-        assert_eq!(payload, expected.into());
+        };
+        assert_eq!(payload, expected);
 
         // ignore path that points to array
-        let selector = PayloadSelector::new_exclude(vec![path("b.f[0]")]);
+        let selector = PayloadSelector::new_exclude(vec![JsonPath::new("b.f[0]")]);
 
         let payload = selector.process(payload);
 
         // no removal
-        let expected = json!({
+        let expected = payload_json! {
             "b": {
                 "c": 123,
                 "f": [1,2,3,4,5],
             }
-        });
-        assert_eq!(payload, expected.into());
+        };
+        assert_eq!(payload, expected);
     }
 }
 
-pub type TheMap<K, V> = BTreeMap<K, V>;
+fn shard_key_string_example() -> String {
+    "region_1".to_string()
+}
+
+fn shard_key_number_example() -> u64 {
+    12
+}
 
 #[derive(Deserialize, Serialize, JsonSchema, Debug, Clone, PartialEq, Eq, Hash)]
 #[serde(untagged)]
 pub enum ShardKey {
+    #[schemars(example = "shard_key_string_example")]
     Keyword(String),
+    #[schemars(example = "shard_key_number_example")]
     Number(u64),
 }
 
@@ -3479,8 +4032,8 @@ impl From<u64> for ShardKey {
 impl Display for ShardKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ShardKey::Keyword(keyword) => write!(f, "\"{}\"", keyword),
-            ShardKey::Number(number) => write!(f, "{}", number),
+            ShardKey::Keyword(keyword) => write!(f, "\"{keyword}\""),
+            ShardKey::Number(number) => write!(f, "{number}"),
         }
     }
 }

@@ -5,13 +5,8 @@ use crate::common::anonymize::Anonymize;
 use crate::common::operation_time_statistics::OperationDurationStatistics;
 use crate::types::{
     PayloadIndexInfo, SegmentConfig, SegmentInfo, SparseVectorDataConfig, VectorDataConfig,
-    VectorDataInfo,
+    VectorDataInfo, VectorNameBuf,
 };
-
-#[derive(Serialize, Clone, Debug, JsonSchema)]
-pub struct VectorIndexesTelemetry {
-    vector_index_searches: Vec<VectorIndexSearchesTelemetry>,
-}
 
 #[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct SegmentTelemetry {
@@ -24,7 +19,11 @@ pub struct SegmentTelemetry {
 #[derive(Serialize, Clone, Debug, JsonSchema)]
 pub struct PayloadIndexTelemetry {
     pub field_name: Option<String>,
+
+    /// The amount of values indexed for all points.
     pub points_values_count: usize,
+
+    /// The amount of points that have at least one value indexed.
     pub points_count: usize,
 
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -41,7 +40,7 @@ impl PayloadIndexTelemetry {
 #[derive(Serialize, Clone, Debug, JsonSchema, Default)]
 pub struct VectorIndexSearchesTelemetry {
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_name: Option<String>,
+    pub index_name: Option<VectorNameBuf>,
 
     #[serde(skip_serializing_if = "OperationDurationStatistics::is_empty")]
     pub unfiltered_plain: OperationDurationStatistics,
@@ -90,6 +89,8 @@ impl Anonymize for SegmentInfo {
             num_points: self.num_points.anonymize(),
             num_indexed_vectors: self.num_indexed_vectors.anonymize(),
             num_deleted_vectors: self.num_deleted_vectors.anonymize(),
+            vectors_size_bytes: self.vectors_size_bytes.anonymize(),
+            payloads_size_bytes: self.payloads_size_bytes.anonymize(),
             ram_usage_bytes: self.ram_usage_bytes.anonymize(),
             disk_usage_bytes: self.disk_usage_bytes.anonymize(),
             is_appendable: self.is_appendable,
@@ -137,7 +138,7 @@ impl Anonymize for VectorDataConfig {
             storage_type: self.storage_type,
             index: self.index.clone(),
             quantization_config: self.quantization_config.clone(),
-            multivec_config: self.multivec_config,
+            multivector_config: self.multivector_config,
             datatype: self.datatype,
         }
     }
@@ -147,6 +148,7 @@ impl Anonymize for SparseVectorDataConfig {
     fn anonymize(&self) -> Self {
         SparseVectorDataConfig {
             index: self.index.anonymize(),
+            storage_type: self.storage_type,
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use collection::config::{CollectionConfig, ShardingMethod};
+use collection::config::{CollectionConfigInternal, ShardingMethod};
 use collection::operations::config_diff::{
     CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
     WalConfigDiff,
@@ -9,14 +9,20 @@ use collection::operations::types::{
     SparseVectorParams, SparseVectorsConfig, VectorsConfig, VectorsConfigDiff,
 };
 use collection::shards::replica_set::ReplicaState;
+use collection::shards::resharding::ReshardKey;
 use collection::shards::shard::{PeerId, ShardId, ShardsPlacement};
 use collection::shards::transfer::{ShardTransfer, ShardTransferKey, ShardTransferRestart};
 use collection::shards::{replica_set, CollectionId};
 use schemars::JsonSchema;
-use segment::types::{PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey};
+use segment::types::{
+    PayloadFieldSchema, PayloadKeyType, QuantizationConfig, ShardKey, StrictModeConfig,
+    VectorNameBuf,
+};
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use validator::Validate;
 
+use crate::content_manager::errors::{StorageError, StorageResult};
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
 
 // *Operation wrapper structure is only required for better OpenAPI generation
@@ -107,12 +113,13 @@ pub struct CreateCollection {
     /// Vector data config.
     /// It is possible to provide one config for single vector mode and list of configs for multiple vectors mode.
     #[serde(default)]
-    #[validate]
+    #[validate(nested)]
     pub vectors: VectorsConfig,
     /// For auto sharding:
     /// Number of shards in collection.
     ///  - Default is 1 for standalone, otherwise equal to the number of nodes
     ///  - Minimum is 1
+    ///
     /// For custom sharding:
     /// Number of shards in collection per shard group.
     ///  - Default is 1, meaning that each shard key will be mapped to a single shard
@@ -142,28 +149,36 @@ pub struct CreateCollection {
     /// It will be read from the disk every time it is requested.
     /// This setting saves RAM by (slightly) increasing the response time.
     /// Note: those payload values that are involved in filtering and are indexed - remain in RAM.
+    ///
+    /// Default: true
     #[serde(default)]
     pub on_disk_payload: Option<bool>,
     /// Custom params for HNSW index. If none - values from service configuration file are used.
-    #[validate]
+    #[validate(nested)]
     pub hnsw_config: Option<HnswConfigDiff>,
     /// Custom params for WAL. If none - values from service configuration file are used.
-    #[validate]
+    #[validate(nested)]
     pub wal_config: Option<WalConfigDiff>,
     /// Custom params for Optimizers.  If none - values from service configuration file are used.
     #[serde(alias = "optimizer_config")]
-    #[validate]
+    #[validate(nested)]
     pub optimizers_config: Option<OptimizersConfigDiff>,
     /// Specify other collection to copy data from.
     #[serde(default)]
     pub init_from: Option<InitFrom>,
     /// Quantization parameters. If none - quantization is disabled.
     #[serde(default, alias = "quantization")]
-    #[validate]
+    #[validate(nested)]
     pub quantization_config: Option<QuantizationConfig>,
     /// Sparse vector data config.
-    #[validate]
-    pub sparse_vectors: Option<BTreeMap<String, SparseVectorParams>>,
+    #[validate(nested)]
+    pub sparse_vectors: Option<BTreeMap<VectorNameBuf, SparseVectorParams>>,
+    /// Strict-mode config.
+    #[validate(nested)]
+    pub strict_mode_config: Option<StrictModeConfig>,
+    #[serde(default)]
+    #[schemars(skip)]
+    pub uuid: Option<Uuid>,
 }
 
 /// Operation for creating new collection and (optionally) specify index params
@@ -176,12 +191,26 @@ pub struct CreateCollectionOperation {
 }
 
 impl CreateCollectionOperation {
-    pub fn new(collection_name: String, create_collection: CreateCollection) -> Self {
-        Self {
+    pub fn new(
+        collection_name: String,
+        create_collection: CreateCollection,
+    ) -> StorageResult<Self> {
+        // validate vector names are unique between dense and sparse vectors
+        if let Some(sparse_config) = &create_collection.sparse_vectors {
+            let mut dense_names = create_collection.vectors.params_iter().map(|p| p.0);
+            if let Some(duplicate_name) = dense_names.find(|name| sparse_config.contains_key(*name))
+            {
+                return Err(StorageError::bad_input(
+                    format!("Dense and sparse vector names must be unique - duplicate found with '{duplicate_name}'"),
+                ));
+            }
+        }
+
+        Ok(Self {
             collection_name,
             create_collection,
             distribution: None,
-        }
+        })
     }
 
     pub fn is_distribution_set(&self) -> bool {
@@ -203,7 +232,7 @@ impl CreateCollectionOperation {
 pub struct UpdateCollection {
     /// Map of vector data parameters to update for each named vector.
     /// To update parameters in a collection having a single unnamed vector, use an empty string as name.
-    #[validate]
+    #[validate(nested)]
     pub vectors: Option<VectorsConfigDiff>,
     /// Custom params for Optimizers.  If none - it is left unchanged.
     /// This operation is blocking, it will only proceed once all current optimizations are complete
@@ -212,15 +241,17 @@ pub struct UpdateCollection {
     /// Collection base params. If none - it is left unchanged.
     pub params: Option<CollectionParamsDiff>,
     /// HNSW parameters to update for the collection index. If none - it is left unchanged.
-    #[validate]
+    #[validate(nested)]
     pub hnsw_config: Option<HnswConfigDiff>,
     /// Quantization parameters to update. If none - it is left unchanged.
     #[serde(default, alias = "quantization")]
-    #[validate]
+    #[validate(nested)]
     pub quantization_config: Option<QuantizationConfigDiff>,
     /// Map of sparse vector data parameters to update for each sparse vector.
-    #[validate]
+    #[validate(nested)]
     pub sparse_vectors: Option<SparseVectorsConfig>,
+    #[validate(nested)]
+    pub strict_mode_config: Option<StrictModeConfig>,
 }
 
 /// Operation for updating parameters of the existing collection
@@ -243,6 +274,7 @@ impl UpdateCollectionOperation {
                 optimizers_config: None,
                 quantization_config: None,
                 sparse_vectors: None,
+                strict_mode_config: None,
             },
             shard_replica_changes: None,
         }
@@ -254,14 +286,6 @@ impl UpdateCollectionOperation {
             update_collection,
             shard_replica_changes: None,
         }
-    }
-
-    // Returns `true` if there are replica changes associated with this operation
-    pub fn have_replica_changes(&self) -> bool {
-        self.shard_replica_changes
-            .as_ref()
-            .map(|changes| !changes.is_empty())
-            .unwrap_or(false)
     }
 
     pub fn take_shard_replica_changes(&mut self) -> Option<Vec<replica_set::Change>> {
@@ -290,6 +314,15 @@ pub struct ChangeAliasesOperation {
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
 #[serde(rename_all = "snake_case")]
 pub struct DeleteCollectionOperation(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize)]
+pub enum ReshardingOperation {
+    Start(ReshardKey),
+    CommitRead(ReshardKey),
+    CommitWrite(ReshardKey),
+    Finish(ReshardKey),
+    Abort(ReshardKey),
+}
 
 #[derive(Debug, Deserialize, Serialize, PartialEq, Eq, Hash, Clone)]
 pub enum ShardTransferOperations {
@@ -368,6 +401,7 @@ pub enum CollectionMetaOperations {
     UpdateCollection(UpdateCollectionOperation),
     DeleteCollection(DeleteCollectionOperation),
     ChangeAliases(ChangeAliasesOperation),
+    Resharding(CollectionId, ReshardingOperation),
     TransferShard(CollectionId, ShardTransferOperations),
     SetShardReplicaState(SetShardReplicaState),
     CreateShardKey(CreateShardKey),
@@ -379,8 +413,8 @@ pub enum CollectionMetaOperations {
 
 /// Use config of the existing collection to generate a create collection operation
 /// for the new collection
-impl From<CollectionConfig> for CreateCollection {
-    fn from(value: CollectionConfig) -> Self {
+impl From<CollectionConfigInternal> for CreateCollection {
+    fn from(value: CollectionConfigInternal) -> Self {
         Self {
             vectors: value.params.vectors,
             shard_number: Some(value.params.shard_number.get()),
@@ -394,6 +428,8 @@ impl From<CollectionConfig> for CreateCollection {
             init_from: None,
             quantization_config: value.quantization_config,
             sparse_vectors: value.params.sparse_vectors,
+            strict_mode_config: value.strict_mode_config,
+            uuid: value.uuid,
         }
     }
 }

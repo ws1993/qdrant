@@ -1,4 +1,4 @@
-use std::iter;
+use std::iter::{self, Chain, Once};
 
 use common::math::fast_sigmoid;
 use common::types::ScoreType;
@@ -6,7 +6,7 @@ use itertools::Itertools;
 
 use super::{Query, TransformInto};
 use crate::common::operation_error::OperationResult;
-use crate::data_types::vectors::{QueryVector, Vector};
+use crate::data_types::vectors::{QueryVector, VectorInternal};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContextPair<T> {
@@ -34,6 +34,7 @@ impl<T> ContextPair<T> {
     /// to approach the best zone, once the best zone is reached, score will be same for all
     /// points inside that zone.
     /// e.g.:
+    /// ```text
     ///                   │
     ///                   │
     ///                   │    +0
@@ -44,9 +45,9 @@ impl<T> ContextPair<T> {
     ///   ─►          ─►  │
     ///  -0.4        -0.1 │   +0
     ///                   │
-    ///
+    /// ```
     /// Simple 2D model:
-    /// https://www.desmos.com/calculator/lbxycyh2hs
+    /// <https://www.desmos.com/calculator/lbxycyh2hs>
     pub fn loss_by(&self, similarity: impl Fn(&T) -> ScoreType) -> ScoreType {
         const MARGIN: ScoreType = ScoreType::EPSILON;
 
@@ -56,6 +57,16 @@ impl<T> ContextPair<T> {
         let difference = positive - negative - MARGIN;
 
         fast_sigmoid(ScoreType::min(difference, 0.0))
+    }
+}
+
+impl<T> IntoIterator for ContextPair<T> {
+    type Item = T;
+
+    type IntoIter = Chain<Once<T>, Once<T>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        iter::once(self.positive).chain(iter::once(self.negative))
     }
 }
 
@@ -113,8 +124,8 @@ impl<T> From<Vec<ContextPair<T>>> for ContextQuery<T> {
     }
 }
 
-impl From<ContextQuery<Vector>> for QueryVector {
-    fn from(query: ContextQuery<Vector>) -> Self {
+impl From<ContextQuery<VectorInternal>> for QueryVector {
+    fn from(query: ContextQuery<VectorInternal>) -> Self {
         QueryVector::Context(query)
     }
 }
@@ -144,8 +155,8 @@ mod test {
             let query = ContextQuery::new(vec![ContextPair::from((p, n))]);
 
             let score = query.score_by(dummy_similarity);
-            assert!(score <= 0.0, "similarity: {}", score);
-            assert!(score > -1.0, "similarity: {}", score);
+            assert!(score <= 0.0, "similarity: {score}");
+            assert!(score > -1.0, "similarity: {score}");
         }
     }
 }

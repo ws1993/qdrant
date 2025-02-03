@@ -12,6 +12,11 @@ from pathlib import Path
 import pytest
 from .assertions import assert_http_ok
 
+
+WAIT_TIME_SEC = 30
+RETRY_INTERVAL_SEC = 0.5
+
+
 # Tracks processes that need to be killed at the end of the test
 processes = []
 busy_ports = {}
@@ -107,7 +112,7 @@ def init_pytest_log_folder() -> str:
 
 
 # Starts a peer and returns its api_uri
-def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, extra_env=None) -> str:
+def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, extra_env=None, reinit=False) -> str:
     if extra_env is None:
         extra_env = {}
     p2p_port = get_port() if port is None else port + 0
@@ -127,14 +132,18 @@ def start_peer(peer_dir: Path, log_file: str, bootstrap_uri: str, port=None, ext
           f" http: http://localhost:{http_port}/cluster, p2p: {p2p_port}")
 
     this_peer_consensus_uri = get_uri(p2p_port)
-    proc = Popen([get_qdrant_exec(), "--bootstrap", bootstrap_uri, "--uri", this_peer_consensus_uri], env=env,
+    if reinit:
+        proc = Popen([get_qdrant_exec(), "--bootstrap", bootstrap_uri, "--uri", this_peer_consensus_uri, "--reinit"], env=env,
+                     cwd=peer_dir, stdout=log_file)
+    else:
+        proc = Popen([get_qdrant_exec(), "--bootstrap", bootstrap_uri, "--uri", this_peer_consensus_uri], env=env,
                  cwd=peer_dir, stdout=log_file)
     processes.append(PeerProcess(proc, http_port, grpc_port, p2p_port))
     return get_uri(http_port)
 
 
 # Starts a peer and returns its api_uri and p2p_uri
-def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None) -> Tuple[str, str]:
+def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None, reinit=False) -> Tuple[str, str]:
     if extra_env is None:
         extra_env = {}
 
@@ -155,7 +164,10 @@ def start_first_peer(peer_dir: Path, log_file: str, port=None, extra_env=None) -
     print(f"\nStarting first peer with uri {bootstrap_uri},"
           f" http: http://localhost:{http_port}/cluster, p2p: {p2p_port}")
 
-    proc = Popen([get_qdrant_exec(), "--uri", bootstrap_uri], env=env, cwd=peer_dir, stdout=log_file)
+    if reinit:
+        proc = Popen([get_qdrant_exec(), "--uri", bootstrap_uri, "--reinit"], env=env, cwd=peer_dir, stdout=log_file)
+    else:
+        proc = Popen([get_qdrant_exec(), "--uri", bootstrap_uri], env=env, cwd=peer_dir, stdout=log_file)
     processes.append(PeerProcess(proc, http_port, grpc_port, p2p_port))
     return get_uri(http_port), bootstrap_uri
 
@@ -250,6 +262,13 @@ def get_collection_info(peer_api_uri: str, collection_name: str) -> dict:
     r = requests.get(f"{peer_api_uri}/collections/{collection_name}")
     assert_http_ok(r)
     res = r.json()["result"]
+    return res
+
+
+def get_collection_point_count(peer_api_uri: str, collection_name: str, exact: bool = False) -> int:
+    r = requests.post(f"{peer_api_uri}/collections/{collection_name}/points/count", json={"exact": exact})
+    assert_http_ok(r)
+    res = r.json()["result"]["count"]
     return res
 
 
@@ -356,9 +375,24 @@ def collection_exists_on_all_peers(collection_name: str, peer_api_uris: [str]) -
 
 def check_collection_local_shards_count(peer_api_uri: str, collection_name: str,
                                         expected_local_shard_count: int) -> bool:
+    return get_collection_local_shards_count(peer_api_uri, collection_name) == expected_local_shard_count
+
+
+def get_collection_local_shards_count(peer_api_uri: str, collection_name: str) -> bool:
     collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name)
-    local_shard_count = len(collection_cluster_info["local_shards"])
-    return local_shard_count == expected_local_shard_count
+    return len(collection_cluster_info["local_shards"])
+
+
+def check_collection_local_shards_point_count(peer_api_uri: str, collection_name: str,
+                                            expected_count: int) -> int:
+    collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name)
+    point_count = sum(map(lambda shard: shard["points_count"], collection_cluster_info["local_shards"]))
+
+    is_correct = point_count == expected_count
+    if not is_correct:
+        print(f"Collection '{collection_name}' on peer {peer_api_uri} ({point_count} != {expected_count}): {json.dumps(collection_cluster_info, indent=4)}")
+
+    return is_correct
 
 
 def check_collection_shard_transfers_count(peer_api_uri: str, collection_name: str,
@@ -366,6 +400,27 @@ def check_collection_shard_transfers_count(peer_api_uri: str, collection_name: s
     collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
     local_shard_count = len(collection_cluster_info["shard_transfers"])
     return local_shard_count == expected_shard_transfers_count
+
+
+def check_collection_resharding_operations_count(peer_api_uri: str, collection_name: str,
+                                           expected_resharding_operations_count: int, headers={}) -> bool:
+    collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
+
+    # TODO(resharding): until resharding release, the resharding operations are not always exposed
+    # Once we do release, we can remove the zero fallback here
+    # See: <https://github.com/qdrant/qdrant/pull/4599>
+    local_resharding_count = len(collection_cluster_info["resharding_operations"]) if "resharding_operations" in collection_cluster_info else 0
+    return local_resharding_count == expected_resharding_operations_count
+
+
+def check_collection_resharding_operation_stage(peer_api_uri: str, collection_name: str, expected_stage: str, headers={}) -> bool:
+    collection_cluster_info = get_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
+    if "resharding_operations" not in collection_cluster_info:
+        return False
+    for resharding in collection_cluster_info["resharding_operations"]:
+        if "comment" in resharding and resharding["comment"].startswith(expected_stage):
+            return True
+    return False
 
 
 def check_collection_shard_transfer_method(peer_api_uri: str, collection_name: str,
@@ -426,14 +481,24 @@ def check_collection_cluster(peer_url, collection_name):
     return res.json()["result"]['local_shards'][0]
 
 
-WAIT_TIME_SEC = 30
-RETRY_INTERVAL_SEC = 0.5
+def check_strict_mode_enabled(peer_api_uri: str, collection_name: str) -> bool:
+    collection_info = get_collection_info(peer_api_uri, collection_name)
+    strict_mode_enabled = collection_info["config"]["strict_mode_config"]["enabled"]
+    return strict_mode_enabled == True
 
 
 def wait_peer_added(peer_api_uri: str, expected_size: int = 1, headers={}) -> str:
     wait_for(check_cluster_size, peer_api_uri, expected_size, headers=headers)
     wait_for(leader_is_defined, peer_api_uri, headers=headers)
     return get_leader(peer_api_uri, headers=headers)
+
+
+def wait_collection_green(peer_api_uri: str, collection_name: str):
+    try:
+        wait_for(check_collection_green, peer_api_uri, collection_name)
+    except Exception as e:
+        print_clusters_info([peer_api_uri])
+        raise e
 
 
 def wait_for_some_replicas_not_active(peer_api_uri: str, collection_name: str):
@@ -513,6 +578,25 @@ def wait_for_collection_shard_transfer_progress(peer_api_uri: str, collection_na
         raise e
 
 
+def wait_for_collection_resharding_operations_count(peer_api_uri: str,
+                                                    collection_name: str,
+                                                    expected_resharding_operations_count:
+                                                    int, headers={}, **kwargs):
+    try:
+        wait_for(check_collection_resharding_operations_count, peer_api_uri, collection_name, expected_resharding_operations_count, headers=headers, **kwargs)
+    except Exception as e:
+        print_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
+        raise e
+
+
+def wait_for_collection_resharding_operation_stage(peer_api_uri: str, collection_name: str, expected_stage: str, headers={}):
+    try:
+        wait_for(check_collection_resharding_operation_stage, peer_api_uri, collection_name, expected_stage, headers=headers)
+    except Exception as e:
+        print_collection_cluster_info(peer_api_uri, collection_name, headers=headers)
+        raise e
+
+
 def wait_for_collection_local_shards_count(peer_api_uri: str, collection_name: str, expected_local_shard_count: int):
     try:
         wait_for(check_collection_local_shards_count, peer_api_uri, collection_name, expected_local_shard_count)
@@ -521,13 +605,21 @@ def wait_for_collection_local_shards_count(peer_api_uri: str, collection_name: s
         raise e
 
 
-def wait_for(condition: Callable[..., bool], *args, wait_for_interval=RETRY_INTERVAL_SEC, **kwargs):
+def wait_for_strict_mode_enabled(peer_api_uri: str, collection_name: str):
+    try:
+        wait_for(check_strict_mode_enabled, peer_api_uri, collection_name)
+    except Exception as e:
+        print_collection_cluster_info(peer_api_uri, collection_name)
+        raise e
+
+
+def wait_for(condition: Callable[..., bool], *args, wait_for_timeout=WAIT_TIME_SEC, wait_for_interval=RETRY_INTERVAL_SEC, **kwargs):
     start = time.time()
     while not condition(*args, **kwargs):
         elapsed = time.time() - start
-        if elapsed > WAIT_TIME_SEC:
+        if elapsed > wait_for_timeout:
             raise Exception(
-                f"Timeout waiting for condition {condition.__name__} to be satisfied in {WAIT_TIME_SEC} seconds")
+                f"Timeout waiting for condition {condition.__name__} to be satisfied in {wait_for_timeout} seconds")
         else:
             time.sleep(wait_for_interval)
 
@@ -546,6 +638,11 @@ def wait_for_peer_online(peer_api_uri: str, path="/readyz"):
     except Exception as e:
         print_clusters_info([peer_api_uri])
         raise e
+
+
+def check_collection_green(peer_api_uri: str, collection_name: str, expected_status: str = "green") -> bool:
+    collection_cluster_info = get_collection_info(peer_api_uri, collection_name)
+    return collection_cluster_info['status'] == expected_status
 
 
 def check_collection_points_count(peer_api_uri: str, collection_name: str, expected_size: int) -> bool:
@@ -587,3 +684,25 @@ def wait_collection_exists_and_active_on_all_peers(collection_name: str, peer_ap
     for peer_uri in peer_api_uris:
         # Collection is active on all peers
         wait_for_all_replicas_active(collection_name=collection_name, peer_api_uri=peer_uri, headers=headers)
+
+
+def create_shard_key(shard_key, peer_url, collection="test_collection", placement=None):
+    r_batch = requests.put(
+        f"{peer_url}/collections/{collection}/shards",
+        json={
+            "shard_key": shard_key,
+            "placement": placement,
+        },
+    )
+    assert_http_ok(r_batch)
+
+def move_shard(source_uri, collection_name, shard_id, source_peer_id, target_peer_id):
+    r = requests.post(
+        f"{source_uri}/collections/{collection_name}/cluster", json={
+            "move_shard": {
+                "shard_id": shard_id,
+                "from_peer_id": source_peer_id,
+                "to_peer_id": target_peer_id
+            }
+        })
+    assert_http_ok(r)

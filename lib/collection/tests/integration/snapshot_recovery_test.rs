@@ -1,20 +1,22 @@
 use std::sync::Arc;
 
+use api::rest::SearchRequestInternal;
 use collection::collection::Collection;
-use collection::config::{CollectionConfig, CollectionParams, WalConfig};
+use collection::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use collection::operations::point_ops::{
-    PointInsertOperationsInternal, PointOperations, PointStruct, WriteOrdering,
+    PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
+    WriteOrdering,
 };
 use collection::operations::shard_selector_internal::ShardSelectorInternal;
 use collection::operations::shared_storage_config::SharedStorageConfig;
-use collection::operations::types::{NodeType, SearchRequestInternal, VectorsConfig};
+use collection::operations::types::{NodeType, VectorsConfig};
 use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::operations::CollectionUpdateOperations;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
 use collection::shards::replica_set::ReplicaState;
+use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::cpu::CpuBudget;
-use segment::data_types::vectors::VectorStruct;
 use segment::types::{Distance, WithPayloadInterface, WithVector};
 use tempfile::Builder;
 
@@ -34,12 +36,14 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         ..CollectionParams::empty()
     };
 
-    let config = CollectionConfig {
+    let config = CollectionConfigInternal {
         params: collection_params,
         optimizer_config: TEST_OPTIMIZERS_CONFIG.clone(),
         wal_config,
         hnsw_config: Default::default(),
         quantization_config: Default::default(),
+        strict_mode_config: Default::default(),
+        uuid: None,
     };
 
     let snapshots_path = Builder::new().prefix("test_snapshots").tempdir().unwrap();
@@ -77,6 +81,7 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         None,
         None,
         CpuBudget::default(),
+        None,
     )
     .await
     .unwrap();
@@ -92,9 +97,9 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
     // Upload 1000 random vectors to the collection
     let mut points = Vec::new();
     for i in 0..100 {
-        points.push(PointStruct {
+        points.push(PointStructPersisted {
             id: i.into(),
-            vector: VectorStruct::from(vec![i as f32, 0.0, 0.0, 0.0]).into(),
+            vector: VectorStructPersisted::Single(vec![i as f32, 0.0, 0.0, 0.0]),
             payload: Some(serde_json::from_str(r#"{"number": "John Doe"}"#).unwrap()),
         });
     }
@@ -135,6 +140,7 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         None,
         None,
         CpuBudget::default(),
+        None,
     )
     .await;
 
@@ -151,22 +157,26 @@ async fn _test_snapshot_and_recover_collection(node_type: NodeType) {
         score_threshold: None,
     };
 
+    let hw_acc = HwMeasurementAcc::new();
     let reference_result = collection
         .search(
             full_search_request.clone().into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            hw_acc,
         )
         .await
         .unwrap();
 
+    let hw_acc = HwMeasurementAcc::new();
     let recovered_result = recovered_collection
         .search(
             full_search_request.into(),
             None,
             &ShardSelectorInternal::All,
             None,
+            hw_acc,
         )
         .await
         .unwrap();

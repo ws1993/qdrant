@@ -36,13 +36,13 @@ impl AsRef<Code> for Code {
 }
 
 #[derive(Default)]
-struct Dashboard {
+pub(crate) struct Dashboard {
     pub issues: DashMap<Code, IssueRecord>,
 }
 
 impl Dashboard {
     /// Activates an issue, returning true if the issue was not active before
-    fn add_issue<I: Issue + 'static>(&self, issue: I) -> bool {
+    pub(crate) fn add_issue<I: Issue + 'static>(&self, issue: I) -> bool {
         let code = Code::of(&issue);
         if self.issues.contains_key(&code) {
             return false;
@@ -52,7 +52,7 @@ impl Dashboard {
     }
 
     /// Deactivates an issue by its code, returning true if the issue was active before
-    fn remove_issue<S: AsRef<Code>>(&self, code: S) -> bool {
+    pub(crate) fn remove_issue<S: AsRef<Code>>(&self, code: S) -> bool {
         if self.issues.contains_key(code.as_ref()) {
             return self.issues.remove(code.as_ref()).is_some();
         }
@@ -60,8 +60,21 @@ impl Dashboard {
     }
 
     /// Returns all issues in the dashboard. This operation clones every issue, so it is more expensive.
-    fn get_all_issues(&self) -> Vec<IssueRecord> {
+    pub(crate) fn get_all_issues(&self) -> Vec<IssueRecord> {
         self.issues.iter().map(|kv| kv.value().clone()).collect()
+    }
+
+    pub(crate) fn get_all_collection_issues(&self, collection_name: &str) -> Vec<IssueRecord> {
+        self.issues
+            .iter()
+            .filter(|kv| {
+                kv.value()
+                    .related_collection
+                    .as_ref()
+                    .is_some_and(|c| c == collection_name)
+            })
+            .map(|kv| kv.value().clone())
+            .collect()
     }
 
     fn get_codes<I: 'static>(&self) -> HashSet<Code> {
@@ -93,6 +106,10 @@ pub fn solve<C: AsRef<Code>>(code: C) -> bool {
 
 pub fn all_issues() -> Vec<IssueRecord> {
     dashboard().get_all_issues()
+}
+
+pub fn all_collection_issues(collection_name: &str) -> Vec<IssueRecord> {
+    dashboard().get_all_collection_issues(collection_name)
 }
 
 /// Clears all issues from the dashboard

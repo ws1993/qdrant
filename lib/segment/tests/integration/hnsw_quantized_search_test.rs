@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
+use common::counter::hardware_counter::HardwareCounterCell;
 use common::cpu::CpuPermit;
 use common::types::{ScoreType, ScoredPointOffset};
 use rand::rngs::StdRng;
@@ -11,22 +12,21 @@ use rand::SeedableRng;
 use segment::data_types::vectors::{only_default_vector, QueryVector, DEFAULT_VECTOR_NAME};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_vector, STR_KEY};
-use segment::index::hnsw_index::graph_links::GraphLinksRam;
-use segment::index::hnsw_index::hnsw::HNSWIndex;
+use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::index::hnsw_index::num_rayon_threads;
 use segment::index::{VectorIndex, VectorIndexEnum};
-use segment::json_path::path;
+use segment::json_path::JsonPath;
+use segment::payload_json;
 use segment::segment::Segment;
-use segment::segment_constructor::build_segment;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
+use segment::segment_constructor::{build_segment, VectorIndexBuildArgs};
 use segment::types::PayloadSchemaType::Keyword;
 use segment::types::{
-    CompressionRatio, Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, Payload,
+    CompressionRatio, Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes,
     ProductQuantizationConfig, QuantizationConfig, QuantizationSearchParams,
     ScalarQuantizationConfig, SearchParams, SegmentConfig, VectorDataConfig, VectorStorageType,
 };
 use segment::vector_storage::quantized::quantized_vectors::QuantizedVectors;
-use serde_json::json;
 use tempfile::Builder;
 
 use crate::fixtures::segment::build_segment_1;
@@ -71,7 +71,7 @@ fn hnsw_quantized_search_test(
                 storage_type: VectorStorageType::Memory,
                 index: Indexes::Plain {},
                 quantization_config: None,
-                multivec_config: None,
+                multivector_config: None,
                 datatype: None,
             },
         )]),
@@ -79,29 +79,28 @@ fn hnsw_quantized_search_test(
         payload_storage_type: Default::default(),
     };
 
+    let hw_counter = HardwareCounterCell::new();
+
     let mut segment = build_segment(dir.path(), &config, true).unwrap();
     for n in 0..num_vectors {
         let idx = n.into();
         let vector = random_vector(&mut rnd, dim);
         segment
-            .upsert_point(op_num, idx, only_default_vector(&vector))
+            .upsert_point(op_num, idx, only_default_vector(&vector), &hw_counter)
             .unwrap();
         op_num += 1;
     }
 
     segment
-        .create_field_index(op_num, &path(STR_KEY), Some(&Keyword.into()))
+        .create_field_index(op_num, &JsonPath::new(STR_KEY), Some(&Keyword.into()))
         .unwrap();
     op_num += 1;
     for n in 0..payloads_count {
         let idx = n.into();
-        let payload: Payload = json!(
-            {
-                STR_KEY: STR_KEY,
-            }
-        )
-        .into();
-        segment.set_full_payload(op_num, idx, &payload).unwrap();
+        let payload = payload_json! {STR_KEY: STR_KEY};
+        segment
+            .set_full_payload(op_num, idx, &payload, &hw_counter)
+            .unwrap();
         op_num += 1;
     }
 
@@ -129,27 +128,33 @@ fn hnsw_quantized_search_test(
     let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
     let permit = Arc::new(CpuPermit::dummy(permit_cpu_count as u32));
 
-    let mut hnsw_index = HNSWIndex::<GraphLinksRam>::open(
-        hnsw_dir.path(),
-        segment.id_tracker.clone(),
-        segment.vector_data[DEFAULT_VECTOR_NAME]
-            .vector_storage
-            .clone(),
-        segment.vector_data[DEFAULT_VECTOR_NAME]
-            .quantized_vectors
-            .clone(),
-        segment.payload_index.clone(),
-        hnsw_config,
+    let hnsw_index = HNSWIndex::build(
+        HnswIndexOpenArgs {
+            path: hnsw_dir.path(),
+            id_tracker: segment.id_tracker.clone(),
+            vector_storage: segment.vector_data[DEFAULT_VECTOR_NAME]
+                .vector_storage
+                .clone(),
+            quantized_vectors: segment.vector_data[DEFAULT_VECTOR_NAME]
+                .quantized_vectors
+                .clone(),
+            payload_index: segment.payload_index.clone(),
+            hnsw_config,
+        },
+        VectorIndexBuildArgs {
+            permit,
+            old_indices: &[],
+            gpu_device: None,
+            stopped: &stopped,
+        },
     )
     .unwrap();
-
-    hnsw_index.build_index(permit, &stopped).unwrap();
 
     let query_vectors = (0..attempts)
         .map(|_| random_vector(&mut rnd, dim).into())
         .collect::<Vec<_>>();
     let filter = Filter::new_must(Condition::Field(FieldCondition::new_match(
-        path(STR_KEY),
+        JsonPath::new(STR_KEY),
         STR_KEY.to_owned().into(),
     )));
 
@@ -176,7 +181,7 @@ fn hnsw_quantized_search_test(
     for n in 0..num_vectors {
         let idx = n.into();
         segment
-            .upsert_point(op_num, idx, only_default_vector(&zero_vector))
+            .upsert_point(op_num, idx, only_default_vector(&zero_vector), &hw_counter)
             .unwrap();
         op_num += 1;
     }
@@ -187,7 +192,7 @@ fn hnsw_quantized_search_test(
 fn check_matches(
     query_vectors: &[QueryVector],
     segment: &Segment,
-    hnsw_index: &HNSWIndex<GraphLinksRam>,
+    hnsw_index: &HNSWIndex,
     filter: Option<&Filter>,
     ef: usize,
     top: usize,
@@ -227,7 +232,7 @@ fn check_matches(
 
 fn check_oversampling(
     query_vectors: &[QueryVector],
-    hnsw_index: &HNSWIndex<GraphLinksRam>,
+    hnsw_index: &HNSWIndex,
     filter: Option<&Filter>,
     ef: usize,
     top: usize,
@@ -275,8 +280,8 @@ fn check_oversampling(
         let worst_2 = oversampling_2_result[0].last().unwrap();
 
         if best_2.score < best_1.score {
-            println!("oversampling_1_result = {:?}", oversampling_1_result);
-            println!("oversampling_2_result = {:?}", oversampling_2_result);
+            println!("oversampling_1_result = {oversampling_1_result:?}");
+            println!("oversampling_2_result = {oversampling_2_result:?}");
         }
 
         assert!(best_2.score >= best_1.score);
@@ -286,7 +291,7 @@ fn check_oversampling(
 
 fn check_rescoring(
     query_vectors: &[QueryVector],
-    hnsw_index: &HNSWIndex<GraphLinksRam>,
+    hnsw_index: &HNSWIndex,
     filter: Option<&Filter>,
     ef: usize,
     top: usize,
@@ -427,7 +432,7 @@ fn test_build_hnsw_using_quantization() {
 
     let mut builder = SegmentBuilder::new(dir.path(), temp_dir.path(), &config).unwrap();
 
-    builder.update_from(&segment1, &stopped).unwrap();
+    builder.update(&[&segment1], &stopped).unwrap();
 
     let built_segment: Segment = builder.build(permit, &stopped).unwrap();
 
@@ -440,7 +445,7 @@ fn test_build_hnsw_using_quantization() {
         .vector_index
         .borrow();
     match borrowed_index.deref() {
-        VectorIndexEnum::HnswRam(hnsw_index) => {
+        VectorIndexEnum::Hnsw(hnsw_index) => {
             assert!(hnsw_index.get_quantized_vectors().borrow().is_some())
         }
         _ => panic!("unexpected vector index type"),

@@ -8,12 +8,12 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use rand::distributions::Standard;
 use rand::Rng;
 use segment::common::rocksdb_wrapper::{open_db, DB_VECTOR_CF};
-use segment::data_types::vectors::{DenseVector, Vector, VectorRef};
+use segment::data_types::vectors::{DenseVector, VectorInternal, VectorRef};
 use segment::fixtures::payload_context_fixture::FixtureIdTracker;
 use segment::id_tracker::IdTrackerSS;
 use segment::types::Distance;
 use segment::vector_storage::dense::simple_dense_vector_storage::open_simple_dense_vector_storage;
-use segment::vector_storage::{new_raw_scorer, VectorStorage, VectorStorageEnum};
+use segment::vector_storage::{new_raw_scorer_for_test, VectorStorage, VectorStorageEnum};
 use tempfile::Builder;
 
 const NUM_VECTORS: usize = 100000;
@@ -30,20 +30,16 @@ fn init_vector_storage(
     dim: usize,
     num: usize,
     dist: Distance,
-) -> (
-    Arc<AtomicRefCell<VectorStorageEnum>>,
-    Arc<AtomicRefCell<IdTrackerSS>>,
-) {
+) -> (VectorStorageEnum, Arc<AtomicRefCell<IdTrackerSS>>) {
     let db = open_db(path, &[DB_VECTOR_CF]).unwrap();
     let id_tracker = Arc::new(AtomicRefCell::new(FixtureIdTracker::new(num)));
-    let storage =
+    let mut storage =
         open_simple_dense_vector_storage(db, DB_VECTOR_CF, dim, dist, &AtomicBool::new(false))
             .unwrap();
     {
-        let mut borrowed_storage = storage.borrow_mut();
         for i in 0..num {
-            let vector: Vector = random_vector(dim).into();
-            borrowed_storage
+            let vector: VectorInternal = random_vector(dim).into();
+            storage
                 .insert_vector(i as PointOffsetType, VectorRef::from(&vector))
                 .unwrap();
         }
@@ -57,7 +53,6 @@ fn benchmark_naive(c: &mut Criterion) {
 
     let dist = Distance::Dot;
     let (storage, id_tracker) = init_vector_storage(dir.path(), DIM, NUM_VECTORS, dist);
-    let borrowed_storage = storage.borrow();
     let borrowed_id_tracker = id_tracker.borrow();
 
     let mut group = c.benchmark_group("storage-score-all");
@@ -66,9 +61,9 @@ fn benchmark_naive(c: &mut Criterion) {
         b.iter(|| {
             let vector = random_vector(DIM);
             let vector = vector.as_slice().into();
-            new_raw_scorer(
+            new_raw_scorer_for_test(
                 vector,
-                &borrowed_storage,
+                &storage,
                 borrowed_id_tracker.deleted_point_bitslice(),
             )
             .unwrap()
@@ -82,7 +77,6 @@ fn random_access_benchmark(c: &mut Criterion) {
 
     let dist = Distance::Dot;
     let (storage, id_tracker) = init_vector_storage(dir.path(), DIM, NUM_VECTORS, dist);
-    let borrowed_storage = storage.borrow();
     let borrowed_id_tracker = id_tracker.borrow();
 
     let mut group = c.benchmark_group("storage-score-random");
@@ -90,9 +84,9 @@ fn random_access_benchmark(c: &mut Criterion) {
     let vector = random_vector(DIM);
     let vector = vector.as_slice().into();
 
-    let scorer = new_raw_scorer(
+    let scorer = new_raw_scorer_for_test(
         vector,
-        &borrowed_storage,
+        &storage,
         borrowed_id_tracker.deleted_point_bitslice(),
     )
     .unwrap();
@@ -104,7 +98,7 @@ fn random_access_benchmark(c: &mut Criterion) {
             total_score += scorer.score_point(random_id);
         })
     });
-    eprintln!("total_score = {:?}", total_score);
+    eprintln!("total_score = {total_score:?}");
 }
 
 criterion_group!(benches, benchmark_naive, random_access_benchmark);
